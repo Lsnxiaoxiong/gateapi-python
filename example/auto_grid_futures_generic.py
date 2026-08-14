@@ -1,8 +1,9 @@
 """Gate 逐仓杠杆现货、SQLite 持久化网格。
 
-一条数据库记录代表一个完整周期：买单 -> 止盈卖单。程序始终维护现价下方
-最近的 ``buy_grid_count`` 个买格。买单成交后才会实际提交止盈卖单；买单尚未
-成交时，数据库只保存计划止盈价，避免卖单自动借入基础币形成意外空头。
+一条数据库记录代表一个完整周期：买单 -> 止盈卖单。主循环只补现价下方最近
+的 ``buy_grid_count`` 个买格；``GridChecker`` 维护买卖窗口并撤销区间外挂单；
+``OrderListener`` 订阅 ``spot.orders``，实时推进成交状态并为成交买单挂止盈。
+买单尚未成交时只保存计划止盈价，避免卖单自动借入基础币形成意外空头。
 
 启动模式：
 - ``resume``：从当前交易对已有数据库状态恢复。
@@ -14,6 +15,8 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
 import math
 import os
 import sqlite3
@@ -24,7 +27,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Optional, TypeVar
+from urllib.parse import urlparse
 
 from urllib3.exceptions import HTTPError
 
@@ -44,19 +49,31 @@ NETWORK_TIMEOUT = (5, 10)
 NETWORK_RETRY_ATTEMPTS = 3
 BALANCE_RETRY_INTERVAL = 30
 CHECK_BATCH_INTERVAL = 0.5
+GRID_CHECK_INTERVAL = 1.0
+REST_RECONCILE_INTERVAL = 30.0
+WEBSOCKET_RECONNECT_INTERVAL = 2.0
+TP_SUBMISSION_STALE_SECONDS = REST_RECONCILE_INTERVAL * 2
 ORDER_SNAPSHOT_LIMIT = 100
 ORPHAN_ORDER_GRACE_SECONDS = 15
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATABASE = SCRIPT_DIR / "grid_orders.sqlite3"
 T = TypeVar("T")
 
-WAIT_BUY = "等待买单成交"
-BUY_FILLED = "买单成交"
+BUY_OPEN = "已挂单、未成交"
+WAIT_BUY = BUY_OPEN
+BUY_FILLED = "已成交"
 BUY_CANCELLED = "买单已取消"
-TP_PLANNED = "已设置止盈单"
-WAIT_TP = "等待止盈"
-TP_FILLED = "止盈单成交"
-TP_NOT_SET = "未设置止盈、等待设置止盈"
+POSITION_NO_TP = "未设置止盈单"
+POSITION_WAIT_TP_ORDER = "等待挂止盈单"
+POSITION_WAIT_TP = "已设置止盈、等待止盈"
+POSITION_TP_FILLED = "止盈已成交"
+TP_NOT_SET = "未设置止盈单"
+TP_PLANNED = TP_NOT_SET
+TP_WAIT_PLACE = "等待挂单"
+TP_SUBMITTING = "正在挂单"
+TP_OPEN = "止盈单已挂单"
+WAIT_TP = TP_OPEN
+TP_FILLED = "止盈已成交"
 TP_CANCELLED = "止盈单已取消"
 TP_DUST = "止盈部分成交、剩余低于最小下单金额"
 
@@ -272,19 +289,33 @@ def desired_buy_orders(
     leverage: Decimal,
     spec: PairSpec,
 ) -> list[PlannedOrder]:
-    start = first_buy_index(reference, current, step_pct, spec.price_step)
-    result: list[PlannedOrder] = []
+    return [
+        PlannedOrder(price, calculate_order_size(margin, leverage, price, spec))
+        for price in desired_buy_prices(
+            reference, current, step_pct, count, spec.price_step
+        )
+    ]
+
+
+def desired_buy_prices(
+    reference: Decimal,
+    current: Decimal,
+    step_pct: Decimal,
+    count: int,
+    price_step: Decimal,
+) -> list[Decimal]:
+    """独立计算现价下方最近的锚定网格价格。"""
+    start = first_buy_index(reference, current, step_pct, price_step)
+    result: list[Decimal] = []
     index = start
     while len(result) < count:
-        price = buy_grid_price(reference, step_pct, index, spec.price_step)
+        price = buy_grid_price(reference, step_pct, index, price_step)
         index += 1
         if price <= 0:
             raise RuntimeError("网格价格小于等于 0")
-        if result and result[-1].price == price:
+        if result and result[-1] == price:
             continue
-        result.append(PlannedOrder(price, calculate_order_size(
-            margin, leverage, price, spec
-        )))
+        result.append(price)
         if index - start > count * 100:
             raise RuntimeError("网格间距小于价格精度")
     return result
@@ -320,11 +351,16 @@ def strategy_code(
     margin: Decimal,
     leverage: Decimal,
     grid_tag: str,
+    max_unclosed_per_grid: int = 2,
 ) -> str:
+    exposure_suffix = (
+        "" if max_unclosed_per_grid == 2
+        else f"|max-unclosed={max_unclosed_per_grid}"
+    )
     raw = (
         f"{grid_tag}|db-margin|{currency_pair}|{decimal_text(reference)}|"
         f"{decimal_text(step_pct)}|{decimal_text(take_profit_pct)}|"
-        f"{decimal_text(margin)}|{decimal_text(leverage)}"
+        f"{decimal_text(margin)}|{decimal_text(leverage)}{exposure_suffix}"
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
 
@@ -360,6 +396,7 @@ class GridStore:
                     buy_order_id TEXT,
                     buy_order_text TEXT,
                     buy_status TEXT NOT NULL,
+                    position_status TEXT NOT NULL DEFAULT '未设置止盈单',
                     tp_price TEXT NOT NULL,
                     tp_order_id TEXT,
                     tp_order_text TEXT,
@@ -374,7 +411,56 @@ class GridStore:
                 ON grid_cycles(currency_pair, strategy_code, completed, in_grid);
                 CREATE INDEX IF NOT EXISTS idx_grid_buy_price
                 ON grid_cycles(currency_pair, strategy_code, buy_price);
+                CREATE INDEX IF NOT EXISTS idx_grid_order_ids
+                ON grid_cycles(buy_order_id, tp_order_id);
+                CREATE INDEX IF NOT EXISTS idx_grid_pending
+                ON grid_cycles(
+                    currency_pair, strategy_code, completed, buy_status, tp_status
+                );
                 """
+            )
+            columns = {
+                str(row[1]) for row in self.db.execute("PRAGMA table_info(grid_cycles)")
+            }
+            if "position_status" not in columns:
+                self.db.execute(
+                    "ALTER TABLE grid_cycles ADD COLUMN position_status TEXT "
+                    "NOT NULL DEFAULT '未设置止盈单'"
+                )
+            # 兼容旧版数据库中的状态文本；订单 ID 和持仓数量保持不变。
+            self.db.execute(
+                "UPDATE grid_cycles SET buy_status=? WHERE buy_status=?",
+                (BUY_OPEN, "等待买单成交"),
+            )
+            self.db.execute(
+                "UPDATE grid_cycles SET buy_status=? WHERE buy_status=?",
+                (BUY_FILLED, "买单成交"),
+            )
+            self.db.execute(
+                "UPDATE grid_cycles SET position_status=?,tp_status=? "
+                "WHERE tp_order_id IS NOT NULL AND tp_status=?",
+                (POSITION_WAIT_TP, TP_OPEN, "等待止盈"),
+            )
+            self.db.execute(
+                "UPDATE grid_cycles SET position_status=?,tp_status=? "
+                "WHERE completed=1 AND tp_status=?",
+                (POSITION_TP_FILLED, TP_FILLED, "止盈单成交"),
+            )
+            self.db.execute(
+                "UPDATE grid_cycles SET position_status=?,tp_status=? "
+                "WHERE buy_status=? AND tp_order_id IS NULL AND completed=0 "
+                "AND tp_status=?",
+                (POSITION_NO_TP, TP_NOT_SET, BUY_OPEN, "已设置止盈单"),
+            )
+            self.db.execute(
+                "UPDATE grid_cycles SET position_status=?,tp_status=? "
+                "WHERE buy_status=? AND tp_order_id IS NULL AND completed=0 "
+                "AND tp_status IN (?,?,?)",
+                (
+                    POSITION_WAIT_TP_ORDER, TP_WAIT_PLACE, BUY_FILLED,
+                    "未设置止盈、等待设置止盈", "已设置止盈单",
+                    TP_CANCELLED,
+                ),
             )
             self.db.commit()
 
@@ -439,20 +525,114 @@ class GridStore:
         )
         return {str(row["tp_order_id"]) for row in rows}
 
+    def one(self, row_id: int) -> Optional[sqlite3.Row]:
+        rows = self.rows("SELECT * FROM grid_cycles WHERE id=?", (row_id,))
+        return rows[0] if rows else None
+
+    def find_order(
+        self, pair: str, code: str, order_id: str, side: str
+    ) -> Optional[sqlite3.Row]:
+        column = "buy_order_id" if side == "buy" else "tp_order_id"
+        rows = self.rows(
+            f"SELECT * FROM grid_cycles WHERE currency_pair=? AND strategy_code=? "
+            f"AND {column}=? ORDER BY id DESC LIMIT 1",
+            (pair, code, str(order_id)),
+        )
+        return rows[0] if rows else None
+
+    def find_order_text(
+        self, pair: str, code: str, order_text: str, side: str
+    ) -> Optional[sqlite3.Row]:
+        column = "buy_order_text" if side == "buy" else "tp_order_text"
+        rows = self.rows(
+            f"SELECT * FROM grid_cycles WHERE currency_pair=? AND strategy_code=? "
+            f"AND {column}=? ORDER BY id DESC LIMIT 1",
+            (pair, code, str(order_text)),
+        )
+        return rows[0] if rows else None
+
+    def claim_take_profit(self, row_id: int) -> bool:
+        now = time.time()
+        with self.lock:
+            cursor = self.db.execute(
+                "UPDATE grid_cycles SET tp_status=?,position_status=?,updated_at=? "
+                "WHERE id=? AND completed=0 AND buy_status=? AND tp_order_id IS NULL "
+                "AND tp_status IN (?,?,?,?)",
+                (
+                    TP_SUBMITTING, POSITION_WAIT_TP_ORDER, now, row_id, BUY_FILLED,
+                    TP_WAIT_PLACE, TP_NOT_SET, TP_CANCELLED, TP_PLANNED,
+                ),
+            )
+            self.db.commit()
+            return cursor.rowcount == 1
+
+    def release_take_profit_claim(self, row_id: int) -> None:
+        self.execute(
+            "UPDATE grid_cycles SET tp_status=?,position_status=?,updated_at=? "
+            "WHERE id=? AND tp_status=?",
+            (
+                TP_WAIT_PLACE, POSITION_WAIT_TP_ORDER, time.time(), row_id,
+                TP_SUBMITTING,
+            ),
+        )
+
+    def recover_stale_take_profit_claims(
+        self, pair: str, code: str, stale_seconds: float
+    ) -> int:
+        with self.lock:
+            cursor = self.db.execute(
+                "UPDATE grid_cycles SET tp_status=?,position_status=?,updated_at=? "
+                "WHERE currency_pair=? AND strategy_code=? AND completed=0 "
+                "AND tp_status=? AND tp_order_id IS NULL AND updated_at<=?",
+                (
+                    TP_WAIT_PLACE, POSITION_WAIT_TP_ORDER, time.time(), pair, code,
+                    TP_SUBMITTING, time.time() - max(0.0, stale_seconds),
+                ),
+            )
+            self.db.commit()
+            return cursor.rowcount
+
+    def set_take_profit_open(self, row_id: int, order) -> None:
+        with self.lock:
+            cursor = self.db.execute(
+                "UPDATE grid_cycles SET tp_order_id=?,tp_order_text=?,tp_status=?,"
+                "position_status=?,updated_at=? WHERE id=? AND completed=0 "
+                "AND tp_status=?",
+                (
+                    str(order.id), str(order.text or ""), TP_OPEN,
+                    POSITION_WAIT_TP, time.time(), row_id, TP_SUBMITTING,
+                ),
+            )
+            self.db.commit()
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"止盈挂单写库抢占已失效：记录={row_id}")
+
     def insert_buy(
         self, pair: str, code: str, order, planned: PlannedOrder, tp: Decimal
     ) -> int:
         now = time.time()
-        return self.execute(
-            "INSERT INTO grid_cycles(currency_pair,strategy_code,buy_price,buy_size,"
-            "remaining_size,buy_order_id,buy_order_text,buy_status,tp_price,tp_status,"
-            "in_grid,completed,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,1,0,?,?)",
-            (
-                pair, code, decimal_text(planned.price), decimal_text(planned.size),
-                decimal_text(planned.size), str(order.id), str(order.text or ""),
-                WAIT_BUY, decimal_text(tp), TP_PLANNED, now, now,
-            ),
-        )
+        with self.lock:
+            existing = self.db.execute(
+                "SELECT id FROM grid_cycles WHERE currency_pair=? "
+                "AND strategy_code=? AND buy_order_id=? ORDER BY id DESC LIMIT 1",
+                (pair, code, str(order.id)),
+            ).fetchone()
+            if existing:
+                return int(existing[0])
+            cursor = self.db.execute(
+                "INSERT INTO grid_cycles(currency_pair,strategy_code,buy_price,"
+                "buy_size,remaining_size,buy_order_id,buy_order_text,buy_status,"
+                "position_status,tp_price,tp_status,in_grid,completed,created_at,"
+                "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,1,0,?,?)",
+                (
+                    pair, code, decimal_text(planned.price),
+                    decimal_text(planned.size), decimal_text(planned.size),
+                    str(order.id), str(order.text or ""), BUY_OPEN,
+                    POSITION_NO_TP, decimal_text(tp), TP_NOT_SET, now, now,
+                ),
+            )
+            self.db.commit()
+            return int(cursor.lastrowid)
 
     def clear_pair(self, pair: str) -> None:
         self.execute("DELETE FROM grid_cycles WHERE currency_pair=?", (pair,))
@@ -542,7 +722,13 @@ def list_order_snapshot(api: SpotApi, pair: str) -> tuple[list, list]:
     return call_with_retry("批量读取订单状态", fetch)
 
 
-def cancel_api_order(api: SpotApi, pair: str, order_id: Optional[str]):
+def cancel_api_order(
+    api: SpotApi,
+    pair: str,
+    order_id: Optional[str],
+    ignore_absent: bool = False,
+):
+    """撤销订单；重置流程可把已关闭或不存在的订单视为已经撤销。"""
     if not order_id:
         return None
     try:
@@ -552,6 +738,12 @@ def cancel_api_order(api: SpotApi, pair: str, order_id: Optional[str]):
     except GateApiException as exc:
         if exc.label not in {"ORDER_NOT_FOUND", "ORDER_CLOSED", "ORDER_CANCELLED"}:
             raise
+        if ignore_absent:
+            print(
+                f"[{now_text()}] 重置跳过已关闭或不存在的订单："
+                f"id={order_id}，label={exc.label}"
+            )
+            return None
         return api_order(api, pair, order_id)
 
 
@@ -580,48 +772,81 @@ def create_limit_order(
     return api.create_order(body, _request_timeout=NETWORK_TIMEOUT)
 
 
-def mark_buy_result(store: GridStore, row, result) -> None:
-    filled = Decimal(str(result.filled_amount or "0"))
+def order_filled_amount(result) -> Decimal:
+    raw = getattr(result, "filled_amount", None)
+    if raw is not None:
+        return Decimal(str(raw or "0"))
+    amount = Decimal(str(getattr(result, "amount", None) or "0"))
+    left = Decimal(str(getattr(result, "left", None) or "0"))
+    return max(Decimal("0"), amount - left)
+
+
+def mark_buy_result(store: GridStore, row, result) -> Optional[sqlite3.Row]:
+    current = store.one(int(row["id"]))
+    if current is None:
+        return None
+    if str(current["buy_order_id"] or "") != str(row["buy_order_id"] or ""):
+        return current
+    row = current
+    filled = order_filled_amount(result)
     finished = result.status in {"closed", "cancelled"}
     if finished and filled > 0:
+        if row["buy_status"] == BUY_FILLED:
+            store.execute(
+                "UPDATE grid_cycles SET last_checked_at=? WHERE id=?",
+                (time.time(), row["id"]),
+            )
+            return store.one(row["id"])
         size = filled
         store.execute(
             "UPDATE grid_cycles SET buy_status=?,buy_size=?,remaining_size=?,"
-            "tp_status=?,last_checked_at=?,updated_at=? WHERE id=?",
+            "position_status=?,tp_status=?,last_checked_at=?,updated_at=? WHERE id=?",
             (
-                BUY_FILLED, decimal_text(size), decimal_text(size), TP_NOT_SET,
-                time.time(), time.time(), row["id"],
+                BUY_FILLED, decimal_text(size), decimal_text(size),
+                POSITION_WAIT_TP_ORDER, TP_WAIT_PLACE, time.time(), time.time(),
+                row["id"],
             ),
         )
         print(f"[{now_text()}] 买单成交：id={row['buy_order_id']}，数量={size}")
     elif finished:
         store.execute("DELETE FROM grid_cycles WHERE id=?", (row["id"],))
+        return None
     else:
         store.execute(
             "UPDATE grid_cycles SET last_checked_at=? WHERE id=?",
             (time.time(), row["id"]),
         )
+    return store.one(row["id"])
 
 
-def mark_tp_result(store: GridStore, row, result) -> None:
-    filled = Decimal(str(result.filled_amount or "0"))
+def mark_tp_result(store: GridStore, row, result) -> Optional[sqlite3.Row]:
+    current = store.one(int(row["id"]))
+    if current is None or current["completed"]:
+        return current
+    if str(current["tp_order_id"] or "") != str(row["tp_order_id"] or ""):
+        return current
+    row = current
+    filled = order_filled_amount(result)
     remaining = Decimal(row["remaining_size"])
     finished = result.status in {"closed", "cancelled"}
     if finished and filled >= remaining:
         store.execute(
-            "UPDATE grid_cycles SET remaining_size='0',tp_status=?,completed=1,"
-            "last_checked_at=?,updated_at=? WHERE id=?",
-            (TP_FILLED, time.time(), time.time(), row["id"]),
+            "UPDATE grid_cycles SET remaining_size='0',tp_status=?,"
+            "position_status=?,completed=1,last_checked_at=?,updated_at=? WHERE id=?",
+            (
+                TP_FILLED, POSITION_TP_FILLED, time.time(), time.time(), row["id"],
+            ),
         )
         print(f"[{now_text()}] 止盈成交：id={row['tp_order_id']}，周期完成")
     elif finished:
         remaining = max(Decimal("0"), remaining - filled)
         store.execute(
             "UPDATE grid_cycles SET remaining_size=?,tp_order_id=NULL,"
-            "tp_order_text=NULL,tp_status=?,last_checked_at=?,updated_at=? WHERE id=?",
+            "tp_order_text=NULL,tp_status=?,position_status=?,last_checked_at=?,"
+            "updated_at=? WHERE id=?",
             (
-                decimal_text(remaining), TP_NOT_SET, time.time(), time.time(),
-                row["id"],
+                decimal_text(remaining), TP_WAIT_PLACE, POSITION_WAIT_TP_ORDER,
+                time.time(), time.time(), row["id"],
             ),
         )
     else:
@@ -629,6 +854,7 @@ def mark_tp_result(store: GridStore, row, result) -> None:
             "UPDATE grid_cycles SET last_checked_at=? WHERE id=?",
             (time.time(), row["id"]),
         )
+    return store.one(row["id"])
 
 
 def update_grid_flags(
@@ -678,48 +904,359 @@ def cancel_orphan_take_profits(
     return cancelled
 
 
-def order_checker(
-    stop: threading.Event,
-    store: GridStore,
-    api: SpotApi,
-    pair: str,
-    code: str,
-    price_state: PriceState,
-    desired_prices_getter: Callable[[], set[Decimal]],
-    sell_prefix: str,
-) -> None:
-    while not stop.is_set():
-        legs = store.pending_legs(pair, code, price_state.get())
+class OrderListener:
+    """监听 ``spot.orders``，实时推进买入与止盈状态，REST 仅作断线校验。"""
+
+    channel_name = "spot.orders"
+    account_name = "margin"
+
+    def __init__(
+        self,
+        stop: threading.Event,
+        store: GridStore,
+        api: SpotApi,
+        pair: str,
+        code: str,
+        spec: PairSpec,
+        take_profit_pct: Decimal,
+        buy_prefix: str,
+        sell_prefix: str,
+        ws_url: str,
+    ):
+        self.stop = stop
+        self.store = store
+        self.api = api
+        self.pair = pair
+        self.code = code
+        self.spec = spec
+        self.take_profit_pct = take_profit_pct
+        self.buy_prefix = buy_prefix
+        self.sell_prefix = sell_prefix
+        self.ws_url = ws_url
+        self.pending_events: dict[str, tuple[dict, float]] = {}
+
+    def _strategy_text(self, side: str) -> str:
+        prefix = self.buy_prefix if side == "buy" else self.sell_prefix
+        return f"t-{prefix}{self.code}"
+
+    def _belongs_to_strategy(self, event: dict) -> bool:
+        side = str(event.get("side", ""))
+        return (
+            str(event.get("currency_pair", "")) == self.pair
+            and side in {"buy", "sell"}
+            and str(event.get("text", "")).startswith(self._strategy_text(side))
+        )
+
+    def _event_from_order(self, order) -> dict:
+        return {
+            "id": str(order.id),
+            "text": str(getattr(order, "text", "") or ""),
+            "currency_pair": str(
+                getattr(order, "currency_pair", self.pair) or self.pair
+            ),
+            "account": str(
+                getattr(order, "account", self.account_name) or self.account_name
+            ),
+            "side": str(getattr(order, "side", "")),
+            "status": str(getattr(order, "status", "")),
+            "filled_amount": decimal_text(order_filled_amount(order)),
+            "amount": str(getattr(order, "amount", "0") or "0"),
+            "left": str(getattr(order, "left", "0") or "0"),
+            "price": str(getattr(order, "price", "0") or "0"),
+        }
+
+    def _insert_missing_buy(self, event: dict) -> bool:
         try:
-            opened, finished = list_order_snapshot(api, pair)
-            snapshot = {
-                str(order.id): order for order in (*opened, *finished)
-            }
-        except Exception as exc:
-            print(f"[{now_text()}] 批量检查订单失败：{exc}")
-            stop.wait(CHECK_BATCH_INTERVAL)
-            continue
-        for row, kind, _ in legs:
+            price = decimal_value("WebSocket买单价格", event.get("price"))
+            size = decimal_value("WebSocket买单数量", event.get("amount"))
+        except ValueError as exc:
+            print(f"[{now_text()}] OrderListener 无法补建买单记录：{exc}")
+            return False
+        order = SimpleNamespace(
+            id=str(event.get("id", "")), text=str(event.get("text", "") or "")
+        )
+        row_id = self.store.insert_buy(
+            self.pair, self.code, order, PlannedOrder(price, size),
+            take_profit_price(price, self.take_profit_pct, self.spec),
+        )
+        print(
+            f"[{now_text()}] OrderListener 补建买单记录："
+            f"价格={price}，数量={size}，id={order.id}，记录={row_id}"
+        )
+        return True
+
+    def handle_order_update(self, event: dict) -> bool:
+        """处理一个订单事件；返回是否找到并更新了对应数据库周期。"""
+        if str(event.get("currency_pair", "")) != self.pair:
+            return False
+        account = str(event.get("account", "") or "")
+        if account and account != self.account_name:
+            return False
+        side = str(event.get("side", ""))
+        if side not in {"buy", "sell"}:
+            return False
+        order_id = str(event.get("id", ""))
+        order_text = str(event.get("text", "") or "")
+        row = self.store.find_order(self.pair, self.code, order_id, side)
+        if row is None and order_text:
+            row = self.store.find_order_text(
+                self.pair, self.code, order_text, side
+            )
+        if row is None:
+            return False
+        result = SimpleNamespace(**event)
+        if side == "buy":
+            updated = mark_buy_result(self.store, row, result)
+            if (
+                updated is not None
+                and updated["buy_status"] == BUY_FILLED
+                and not updated["tp_order_id"]
+            ):
+                submit_take_profit(
+                    self.api, self.store, updated, self.pair, self.code,
+                    self.spec, self.sell_prefix,
+                )
+        else:
+            mark_tp_result(self.store, row, result)
+        return True
+
+    def _receive_event(self, event: dict) -> None:
+        if self.handle_order_update(event):
+            return
+        if (
+            self._belongs_to_strategy(event)
+            and str(event.get("side", "")) == "buy"
+            and self._insert_missing_buy(event)
+            and self.handle_order_update(event)
+        ):
+            return
+        if self._belongs_to_strategy(event):
+            self.pending_events[str(event.get("id", ""))] = (
+                event, time.monotonic() + ORPHAN_ORDER_GRACE_SECONDS
+            )
+
+    def _flush_pending_events(self) -> None:
+        now = time.monotonic()
+        for order_id, (event, deadline) in list(self.pending_events.items()):
+            if self.handle_order_update(event) or now >= deadline:
+                self.pending_events.pop(order_id, None)
+
+    def reconcile_rest(self, exact_missing: bool = False) -> None:
+        opened, finished = list_order_snapshot(self.api, self.pair)
+        # 活动买单可能在进程崩溃前已提交、但尚未来得及写库；按订单 ID 幂等补建。
+        for order in opened:
+            event = self._event_from_order(order)
+            if self._belongs_to_strategy(event):
+                self._receive_event(event)
+        # 历史完成订单只更新已有记录，避免 reset 后重新导入旧策略历史。
+        for order in finished:
+            event = self._event_from_order(order)
+            if self._belongs_to_strategy(event):
+                self.handle_order_update(event)
+        snapshot = {str(order.id): order for order in (*opened, *finished)}
+        for row, kind, _ in self.store.pending_legs(
+            self.pair, self.code, Decimal("0")
+        ):
             order_id = str(
                 row["buy_order_id"] if kind == "buy" else row["tp_order_id"]
             )
-            try:
-                # finished 列表有数量上限；极老挂单刚成交时可能不在快照中。
-                result = snapshot.get(order_id) or api_order(api, pair, order_id)
-                if kind == "buy":
-                    mark_buy_result(store, row, result)
-                else:
-                    mark_tp_result(store, row, result)
-            except Exception as exc:
-                print(f"[{now_text()}] 检查订单 {order_id} 失败：{exc}")
-        try:
-            cancel_orphan_take_profits(
-                api, store, pair, code, sell_prefix, opened
+            result = snapshot.get(order_id)
+            if result is None and exact_missing:
+                try:
+                    result = api_order(self.api, self.pair, order_id)
+                except Exception as exc:
+                    print(
+                        f"[{now_text()}] OrderListener 补查订单 {order_id} 失败：{exc}"
+                    )
+                    continue
+            if result is None:
+                continue
+            event = self._event_from_order(result)
+            if not event["side"]:
+                event["side"] = kind if kind == "buy" else "sell"
+            self.handle_order_update(event)
+        cancel_orphan_take_profits(
+            self.api, self.store, self.pair, self.code, self.sell_prefix, opened
+        )
+        recovered = self.store.recover_stale_take_profit_claims(
+            self.pair, self.code, TP_SUBMISSION_STALE_SECONDS
+        )
+        if recovered:
+            print(
+                f"[{now_text()}] OrderListener 恢复超时止盈挂单状态："
+                f"{recovered} 条"
             )
+
+    def _subscription(self, api_key: str, api_secret: str) -> str:
+        timestamp = int(time.time())
+        channel = "spot.orders"
+        event = "subscribe"
+        payload = f"channel={channel}&event={event}&time={timestamp}"
+        signature = hmac.new(
+            api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha512
+        ).hexdigest()
+        return json.dumps({
+            "time": timestamp,
+            "channel": channel,
+            "event": event,
+            "payload": [self.pair],
+            "auth": {"method": "api_key", "KEY": api_key, "SIGN": signature},
+        })
+
+    @staticmethod
+    def _proxy_options() -> dict:
+        proxy = os.getenv("GATE_PROXY", "").strip()
+        if not proxy:
+            return {}
+        parsed = urlparse(proxy)
+        if not parsed.hostname:
+            return {}
+        options = {
+            "http_proxy_host": parsed.hostname,
+            "http_proxy_port": parsed.port,
+            "proxy_type": (
+                "http" if parsed.scheme in {"", "http", "https"}
+                else parsed.scheme
+            ),
+        }
+        if parsed.username:
+            options["http_proxy_auth"] = (parsed.username, parsed.password or "")
+        return options
+
+    def run(self, api_key: str, api_secret: str) -> None:
+        try:
+            import websocket
+        except ImportError as exc:
+            print(
+                f"[{now_text()}] OrderListener 无法启动：缺少 websocket-client；"
+                "请执行 pip install websocket-client"
+            )
+            self.stop.set()
+            return
+        try:
+            self.reconcile_rest(exact_missing=True)
         except Exception as exc:
-            print(f"[{now_text()}] 检查无关联止盈卖单失败：{exc}")
-        update_grid_flags(store, pair, code, desired_prices_getter())
-        stop.wait(CHECK_BATCH_INTERVAL)
+            print(f"[{now_text()}] OrderListener 启动校验失败：{exc}")
+        while not self.stop.is_set():
+            ws = None
+            try:
+                ws = websocket.create_connection(
+                    self.ws_url,
+                    timeout=NETWORK_TIMEOUT[1],
+                    **self._proxy_options(),
+                )
+                ws.send(self._subscription(api_key, api_secret))
+                ws.settimeout(1)
+                last_rest = time.monotonic()
+                last_ping = time.monotonic()
+                print(
+                    f"[{now_text()}] OrderListener 已订阅 "
+                    f"{self.pair} {self.channel_name}"
+                )
+                while not self.stop.is_set():
+                    try:
+                        raw = ws.recv()
+                        if not raw:
+                            raise ConnectionError("WebSocket 连接已关闭")
+                        message = json.loads(raw)
+                        if message.get("error"):
+                            raise RuntimeError(f"WebSocket 返回错误：{message['error']}")
+                        if message.get("event") == "update":
+                            result = message.get("result") or []
+                            for event in result if isinstance(result, list) else [result]:
+                                if isinstance(event, dict):
+                                    self._receive_event(event)
+                    except websocket.WebSocketTimeoutException:
+                        pass
+                    self._flush_pending_events()
+                    now = time.monotonic()
+                    if now - last_ping >= 20:
+                        ws.ping()
+                        last_ping = now
+                    if now - last_rest >= REST_RECONCILE_INTERVAL:
+                        self.reconcile_rest()
+                        last_rest = now
+            except Exception as exc:
+                if not self.stop.is_set():
+                    print(f"[{now_text()}] OrderListener 断线：{exc}；准备重连")
+                    try:
+                        self.reconcile_rest(exact_missing=True)
+                    except Exception as reconcile_exc:
+                        print(f"[{now_text()}] OrderListener 断线补查失败：{reconcile_exc}")
+                    self.stop.wait(WEBSOCKET_RECONNECT_INTERVAL)
+            finally:
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+
+
+class GridChecker:
+    """维护现价上下方网格窗口，不承担订单成交状态轮询。"""
+
+    def __init__(
+        self,
+        stop: threading.Event,
+        store: GridStore,
+        api: SpotApi,
+        pair: str,
+        code: str,
+        price_state: PriceState,
+        reference: Decimal,
+        step_pct: Decimal,
+        buy_grid_count: int,
+        take_profit_grid_count: int,
+        take_profit_count: int,
+        spec: PairSpec,
+        sell_prefix: str,
+        max_unclosed_per_grid: int = 2,
+    ):
+        self.stop = stop
+        self.store = store
+        self.api = api
+        self.pair = pair
+        self.code = code
+        self.price_state = price_state
+        self.reference = reference
+        self.step_pct = step_pct
+        self.buy_grid_count = buy_grid_count
+        self.take_profit_grid_count = take_profit_grid_count
+        self.take_profit_count = take_profit_count
+        self.spec = spec
+        self.sell_prefix = sell_prefix
+        self.max_unclosed_per_grid = max_unclosed_per_grid
+
+    def run(self) -> None:
+        while not self.stop.is_set():
+            try:
+                current = self.price_state.get()
+                desired_prices = set(desired_buy_prices(
+                    self.reference, current, self.step_pct,
+                    self.buy_grid_count, self.spec.price_step,
+                ))
+                update_grid_flags(
+                    self.store, self.pair, self.code, desired_prices
+                )
+                trim_outside_grid(
+                    self.api, self.store, self.pair, self.code, desired_prices,
+                    self.max_unclosed_per_grid,
+                )
+                upper = take_profit_window_upper(
+                    self.reference, current, self.step_pct,
+                    self.take_profit_grid_count, self.spec,
+                )
+                reconcile_take_profits(
+                    self.api, self.store, self.pair, self.code, current, upper,
+                    self.spec, self.sell_prefix, self.take_profit_count,
+                )
+            except Exception as exc:
+                detail = (
+                    f"label={exc.label}, message={exc.message}"
+                    if isinstance(exc, GateApiException) else str(exc)
+                )
+                print(f"[{now_text()}] GridChecker 本轮失败：{detail}")
+            self.stop.wait(GRID_CHECK_INTERVAL)
 
 
 def place_missing_buys(
@@ -732,16 +1269,23 @@ def place_missing_buys(
     spec: PairSpec,
     auto_borrow: bool,
     prefix: str,
+    max_unclosed_per_grid: int = 2,
 ) -> bool:
     rows = store.active(pair, code)
     pending_prices = {
         Decimal(row["buy_price"]) for row in rows if row["buy_status"] == WAIT_BUY
     }
     for planned in desired:
-        if planned.price in pending_prices:
+        if (
+            store.exposure_count(pair, code, planned.price)
+            >= max_unclosed_per_grid
+        ):
+            print(
+                f"[{now_text()}] {planned.price} 已有"
+                f"{max_unclosed_per_grid}组未止盈持仓，跳过新买单"
+            )
             continue
-        if store.exposure_count(pair, code, planned.price) >= 2:
-            print(f"[{now_text()}] {planned.price} 已有2组未止盈持仓，跳过新买单")
+        if planned.price in pending_prices:
             continue
         try:
             order = create_limit_order(
@@ -766,6 +1310,81 @@ def place_missing_buys(
     return True
 
 
+def submit_take_profit(
+    api: SpotApi,
+    store: GridStore,
+    row,
+    pair: str,
+    code: str,
+    spec: PairSpec,
+    prefix: str,
+) -> bool:
+    """为一个已成交买单挂止盈；数据库抢占确保监听器和检查器不会重复下单。"""
+    refreshed = store.one(int(row["id"]))
+    if (
+        refreshed is None
+        or refreshed["completed"]
+        or refreshed["buy_status"] != BUY_FILLED
+        or refreshed["tp_order_id"]
+    ):
+        return False
+    size = Decimal(refreshed["remaining_size"])
+    price = Decimal(refreshed["tp_price"])
+    notional = size * price
+    if size < spec.min_base_amount or notional < spec.min_quote_amount:
+        store.execute(
+            "UPDATE grid_cycles SET tp_status=?,position_status=?,updated_at=? "
+            "WHERE id=?",
+            (TP_DUST, POSITION_WAIT_TP_ORDER, time.time(), refreshed["id"]),
+        )
+        print(
+            f"[{now_text()}] 止盈剩余转为碎片：记录={refreshed['id']}，"
+            f"数量={size}，金额={decimal_text(notional)} USDT"
+        )
+        return False
+    if not store.claim_take_profit(int(refreshed["id"])):
+        return False
+    try:
+        order = create_limit_order(
+            api, pair, "sell", price, size, False, prefix, code
+        )
+    except GateApiException as exc:
+        message = str(exc.message or "").lower()
+        if exc.label == "INVALID_PARAM_VALUE" and (
+            "too small" in message or "minimum" in message
+        ):
+            store.execute(
+                "UPDATE grid_cycles SET tp_status=?,position_status=?,updated_at=? "
+                "WHERE id=?",
+                (TP_DUST, POSITION_WAIT_TP_ORDER, time.time(), refreshed["id"]),
+            )
+            print(
+                f"[{now_text()}] Gate拒绝过小止盈，已转为碎片："
+                f"记录={refreshed['id']}，数量={size}，金额="
+                f"{decimal_text(notional)} USDT"
+            )
+            return False
+        store.release_take_profit_claim(int(refreshed["id"]))
+        if exc.label == "BALANCE_NOT_ENOUGH":
+            print(f"[{now_text()}] 基础币余额不足，暂不能设置止盈：记录{refreshed['id']}")
+            return False
+        raise
+    except Exception:
+        store.release_take_profit_claim(int(refreshed["id"]))
+        raise
+    try:
+        store.set_take_profit_open(int(refreshed["id"]), order)
+    except Exception:
+        cancel_api_order(api, pair, str(order.id))
+        store.release_take_profit_claim(int(refreshed["id"]))
+        raise
+    print(
+        f"[{now_text()}] 设置止盈：买价={refreshed['buy_price']}，"
+        f"卖价={price}，id={order.id}"
+    )
+    return True
+
+
 def reconcile_take_profits(
     api: SpotApi,
     store: GridStore,
@@ -780,7 +1399,7 @@ def reconcile_take_profits(
     for row in store.active(pair, code):
         if (
             row["buy_status"] != BUY_FILLED
-            or row["tp_status"] == WAIT_TP
+            or row["tp_status"] in {TP_OPEN, TP_SUBMITTING}
             or Decimal(row["remaining_size"]) <= 0
         ):
             continue
@@ -792,8 +1411,10 @@ def reconcile_take_profits(
         if row["tp_status"] != TP_DUST:
             store.execute(
                 "UPDATE grid_cycles SET tp_order_id=NULL,tp_order_text=NULL,"
-                "tp_status=?,updated_at=? WHERE id=?",
-                (TP_DUST, time.time(), row["id"]),
+                "tp_status=?,position_status=?,updated_at=? WHERE id=?",
+                (
+                    TP_DUST, POSITION_WAIT_TP_ORDER, time.time(), row["id"],
+                ),
             )
             print(
                 f"[{now_text()}] 止盈剩余转为碎片：记录={row['id']}，"
@@ -804,7 +1425,9 @@ def reconcile_take_profits(
     eligible = [
         row for row in store.active(pair, code)
         if row["buy_status"] == BUY_FILLED
-        and row["tp_status"] in {TP_NOT_SET, TP_CANCELLED, TP_PLANNED}
+        and row["tp_status"] in {
+            TP_NOT_SET, TP_WAIT_PLACE, TP_CANCELLED, TP_PLANNED
+        }
         and current < Decimal(row["tp_price"]) <= upper_price
         and Decimal(row["remaining_size"]) > 0
     ]
@@ -812,7 +1435,7 @@ def reconcile_take_profits(
     eligible.extend(
         row for row in store.active(pair, code)
         if row["buy_status"] == BUY_FILLED
-        and row["tp_status"] == WAIT_TP
+        and row["tp_status"] == TP_OPEN
         and current < Decimal(row["tp_price"]) <= upper_price
         and Decimal(row["remaining_size"]) > 0
     )
@@ -820,7 +1443,7 @@ def reconcile_take_profits(
     selected_ids = {row["id"] for row in eligible[:limit]}
 
     for row in store.active(pair, code):
-        if row["tp_status"] != WAIT_TP or row["id"] in selected_ids:
+        if row["tp_status"] != TP_OPEN or row["id"] in selected_ids:
             continue
         result = cancel_api_order(api, pair, row["tp_order_id"])
         mark_tp_result(store, row, result)
@@ -838,47 +1461,9 @@ def reconcile_take_profits(
         tuple(selected_ids),
     )
     for row in rows:
-        if row["tp_status"] == WAIT_TP or row["completed"]:
+        if row["tp_status"] in {TP_OPEN, TP_SUBMITTING} or row["completed"]:
             continue
-        price = Decimal(row["tp_price"])
-        size = Decimal(row["remaining_size"])
-        try:
-            order = create_limit_order(
-                api, pair, "sell", price, size, False, prefix, code
-            )
-        except GateApiException as exc:
-            message = str(exc.message or "").lower()
-            if exc.label == "INVALID_PARAM_VALUE" and (
-                "too small" in message or "minimum" in message
-            ):
-                store.execute(
-                    "UPDATE grid_cycles SET tp_order_id=NULL,tp_order_text=NULL,"
-                    "tp_status=?,updated_at=? WHERE id=?",
-                    (TP_DUST, time.time(), row["id"]),
-                )
-                print(
-                    f"[{now_text()}] Gate拒绝过小止盈，已转为碎片："
-                    f"记录={row['id']}，数量={size}，金额="
-                    f"{decimal_text(size * price)} USDT"
-                )
-                continue
-            if exc.label == "BALANCE_NOT_ENOUGH":
-                print(f"[{now_text()}] 基础币余额不足，暂不能设置止盈：记录{row['id']}")
-                return
-            raise
-        try:
-            store.execute(
-                "UPDATE grid_cycles SET tp_order_id=?,tp_order_text=?,tp_status=?,"
-                "updated_at=? WHERE id=?",
-                (
-                    str(order.id), str(order.text or ""), WAIT_TP,
-                    time.time(), row["id"],
-                ),
-            )
-        except Exception:
-            cancel_api_order(api, pair, str(order.id))
-            raise
-        print(f"[{now_text()}] 设置止盈：买价={row['buy_price']}，卖价={price}，id={order.id}")
+        submit_take_profit(api, store, row, pair, code, spec, prefix)
 
 
 def trim_outside_grid(
@@ -887,53 +1472,48 @@ def trim_outside_grid(
     pair: str,
     code: str,
     desired_prices: set[Decimal],
+    max_unclosed_per_grid: int = 2,
 ) -> None:
-    minimum_grid_price = min(desired_prices)
-    for row in store.active(pair, code):
+    outside = [
+        row for row in store.active(pair, code)
+        if row["buy_status"] == BUY_OPEN
+        and (
+            Decimal(row["buy_price"]) not in desired_prices
+            or store.exposure_count(
+                pair, code, Decimal(row["buy_price"])
+            ) >= max_unclosed_per_grid
+        )
+    ]
+    # 先撤销距离当前窗口最远的挂单，数据库与交易所逐条保持一致。
+    window_center = (min(desired_prices) + max(desired_prices)) / Decimal("2")
+    outside.sort(
+        key=lambda row: abs(Decimal(row["buy_price"]) - window_center),
+        reverse=True,
+    )
+    for row in outside:
         buy_price = Decimal(row["buy_price"])
-        # 下跌时，高位旧买单可能正在成交，必须保留并继续设置止盈；
-        # 只裁剪价格上涨后落到当前窗口最远下方的记录。
-        if buy_price >= minimum_grid_price:
-            continue
-        if row["buy_status"] == WAIT_BUY:
-            result = cancel_api_order(api, pair, row["buy_order_id"])
-            if row["tp_order_id"]:
-                cancel_api_order(api, pair, row["tp_order_id"])
-            filled = Decimal(str(getattr(result, "filled_amount", None) or "0"))
-            if filled > 0:
-                store.execute(
-                    "UPDATE grid_cycles SET buy_status=?,buy_size=?,remaining_size=?,"
-                    "tp_order_id=NULL,tp_order_text=NULL,tp_status=?,in_grid=0,"
-                    "updated_at=? WHERE id=?",
-                    (
-                        BUY_FILLED, decimal_text(filled), decimal_text(filled),
-                        TP_NOT_SET, time.time(), row["id"],
-                    ),
-                )
-                print(
-                    f"[{now_text()}] 区间外买单部分成交 {filled}，"
-                    f"保留持仓并等待止盈：{row['buy_price']}"
-                )
-            else:
-                store.execute("DELETE FROM grid_cycles WHERE id=?", (row["id"],))
-                print(f"[{now_text()}] 移除区间外未成交买单并删库：{row['buy_price']}")
-        elif row["buy_status"] == BUY_FILLED:
-            if not row["in_grid"] and not row["tp_order_id"]:
-                continue
-            if row["tp_order_id"] and row["tp_status"] == WAIT_TP:
-                result = cancel_api_order(api, pair, row["tp_order_id"])
-                mark_tp_result(store, row, result)
-                refreshed = store.rows(
-                    "SELECT * FROM grid_cycles WHERE id=?", (row["id"],)
-                )[0]
-                if refreshed["completed"]:
-                    continue
+        blocked_by_exposure = (
+            store.exposure_count(pair, code, buy_price)
+            >= max_unclosed_per_grid
+        )
+        result = cancel_api_order(api, pair, row["buy_order_id"])
+        updated = mark_buy_result(store, row, result)
+        if updated is not None and updated["buy_status"] == BUY_FILLED:
+            filled = Decimal(updated["buy_size"])
             store.execute(
-                "UPDATE grid_cycles SET in_grid=0,tp_order_id=NULL,"
-                "tp_order_text=NULL,tp_status=?,updated_at=? WHERE id=?",
-                (TP_NOT_SET, time.time(), row["id"]),
+                "UPDATE grid_cycles SET in_grid=0,updated_at=? WHERE id=?",
+                (time.time(), updated["id"]),
             )
-            print(f"[{now_text()}] 区间外已成交买单保留，止盈转为等待设置：{row['buy_price']}")
+            print(
+                f"[{now_text()}] 区间外买单部分成交 {filled}，"
+                f"保留持仓并等待止盈：{buy_price}"
+            )
+        else:
+            reason = (
+                f"同价位已有{max_unclosed_per_grid}组未止盈持仓"
+                if blocked_by_exposure else "超出买格区间"
+            )
+            print(f"[{now_text()}] 移除未成交买单并删库：{buy_price}，原因={reason}")
 
 
 def reset_pair(api: SpotApi, store: GridStore, pair: str) -> None:
@@ -942,9 +1522,13 @@ def reset_pair(api: SpotApi, store: GridStore, pair: str) -> None:
     )
     for row in rows:
         if row["buy_status"] == WAIT_BUY:
-            cancel_api_order(api, pair, row["buy_order_id"])
+            cancel_api_order(
+                api, pair, row["buy_order_id"], ignore_absent=True
+            )
         if row["tp_status"] == WAIT_TP:
-            cancel_api_order(api, pair, row["tp_order_id"])
+            cancel_api_order(
+                api, pair, row["tp_order_id"], ignore_absent=True
+            )
     store.clear_pair(pair)
     print(f"[{now_text()}] 已重置 {pair} 数据库状态及其记录的未成交订单")
 
@@ -959,7 +1543,8 @@ def run_grid(
     sell_client_order_prefix: str = "dt",
     buy_grid_count: int = 10,
     take_profit_count: int = 10,
-    take_profit_grid_count: int = 20,
+    take_profit_grid_count: int = 10,
+    max_unclosed_per_grid: int = 2,
     grid_step_pct="0.003",
     take_profit_pct="0.003",
     auto_borrow: bool = False,
@@ -975,6 +1560,8 @@ def run_grid(
         raise ValueError("startup_mode 只能是 resume 或 reset")
     if buy_grid_count <= 0 or take_profit_count <= 0 or take_profit_grid_count <= 0:
         raise ValueError("买格、止盈单数量和止盈网格区间必须大于 0")
+    if max_unclosed_per_grid <= 0:
+        raise ValueError("max_unclosed_per_grid 必须大于 0")
     if poll_interval < 0.5:
         raise ValueError("poll_interval 不能小于 0.5 秒")
     for name, value in (
@@ -997,6 +1584,7 @@ def run_grid(
 
     load_env_file()
     host = os.getenv("GATE_HOST", "https://api.gateio.ws/api/v4").strip()
+    ws_url = os.getenv("GATE_WS_URL", "wss://api.gateio.ws/ws/v4/").strip()
     live = os.getenv("GATE_LIVE_CONFIRM", "") == LIVE_CONFIRM_TEXT
     public_client = ApiClient(make_configuration(host))
     try:
@@ -1028,38 +1616,53 @@ def run_grid(
     api_secret = required_env("GATE_API_SECRET")
     main_client = ApiClient(make_configuration(host, api_key, api_secret))
     checker_client = ApiClient(make_configuration(host, api_key, api_secret))
+    listener_client = ApiClient(make_configuration(host, api_key, api_secret))
     api = SpotApi(main_client)
     checker_api = SpotApi(checker_client)
+    listener_api = SpotApi(listener_client)
     margin_api = MarginApi(main_client)
-    store = GridStore(Path(database_path))
-    code = strategy_code(
-        pair, reference, step_pct, tp_pct, margin, leverage_value, grid_tag
-    )
-    price_state = PriceState(current)
-    desired_lock = threading.Lock()
-    desired_state = {order.price for order in desired}
-
-    def get_desired_prices() -> set[Decimal]:
-        with desired_lock:
-            return set(desired_state)
-
-    stop = threading.Event()
-    checker = threading.Thread(
-        target=order_checker,
-        args=(
-            stop, store, checker_api, pair, code, price_state,
-            get_desired_prices, sell_client_order_prefix,
-        ),
-        name=f"grid-check-{pair}",
-        daemon=True,
-    )
     try:
         process_lock.acquire()
     except Exception:
-        store.close()
+        listener_client.close()
         checker_client.close()
         main_client.close()
         raise
+    try:
+        store = GridStore(Path(database_path))
+    except Exception:
+        process_lock.release()
+        listener_client.close()
+        checker_client.close()
+        main_client.close()
+        raise
+    code = strategy_code(
+        pair, reference, step_pct, tp_pct, margin, leverage_value, grid_tag,
+        max_unclosed_per_grid,
+    )
+    price_state = PriceState(current)
+
+    stop = threading.Event()
+    grid_checker = GridChecker(
+        stop, store, checker_api, pair, code, price_state, reference, step_pct,
+        buy_grid_count, take_profit_grid_count, take_profit_count, spec,
+        sell_client_order_prefix, max_unclosed_per_grid,
+    )
+    order_listener = OrderListener(
+        stop, store, listener_api, pair, code, spec, tp_pct,
+        buy_client_order_prefix, sell_client_order_prefix, ws_url,
+    )
+    checker = threading.Thread(
+        target=grid_checker.run,
+        name=f"grid-check-{pair}",
+        daemon=True,
+    )
+    listener = threading.Thread(
+        target=order_listener.run,
+        args=(api_key, api_secret),
+        name=f"order-listener-{pair}",
+        daemon=True,
+    )
     try:
         configure_margin_settings(
             margin_api, pair, leverage_value, auto_repay
@@ -1077,6 +1680,7 @@ def run_grid(
                     f"数据库中存在 {pair} 的其他未完成策略：{details}。"
                     "当前参数不能安全恢复；确认撤销旧策略后请使用 startup_mode='reset'。"
                 )
+        listener.start()
         checker.start()
         print(
             f"[{now_text()}] 启动数据库网格：{pair}，模式={startup_mode}，"
@@ -1085,7 +1689,7 @@ def run_grid(
         cycle = 0
         failures = 0
         balance_cooldown_until = 0.0
-        while max_cycles is None or cycle < max_cycles:
+        while not stop.is_set() and (max_cycles is None or cycle < max_cycles):
             cycle += 1
             try:
                 current = get_last_price(api, pair)
@@ -1094,23 +1698,14 @@ def run_grid(
                     reference, current, step_pct, buy_grid_count,
                     margin, leverage_value, spec
                 )
-                desired_prices = {order.price for order in desired}
-                with desired_lock:
-                    desired_state.clear()
-                    desired_state.update(desired_prices)
-                update_grid_flags(store, pair, code, desired_prices)
-                trim_outside_grid(api, store, pair, code, desired_prices)
                 tp_upper = take_profit_window_upper(
                     reference, current, step_pct, take_profit_grid_count, spec
-                )
-                reconcile_take_profits(
-                    api, store, pair, code, current, tp_upper, spec,
-                    sell_client_order_prefix, take_profit_count
                 )
                 if time.monotonic() >= balance_cooldown_until:
                     funded = place_missing_buys(
                         api, store, pair, code, desired, tp_pct, spec,
-                        auto_borrow, buy_client_order_prefix
+                        auto_borrow, buy_client_order_prefix,
+                        max_unclosed_per_grid,
                     )
                     if not funded:
                         balance_cooldown_until = (
@@ -1119,7 +1714,12 @@ def run_grid(
                 rows = store.active(pair, code)
                 pending_buys = sum(row["buy_status"] == WAIT_BUY for row in rows)
                 open_tps = sum(row["tp_status"] == WAIT_TP for row in rows)
-                waiting_tps = sum(row["tp_status"] == TP_NOT_SET for row in rows)
+                waiting_tps = sum(
+                    row["tp_status"] in {
+                        TP_NOT_SET, TP_WAIT_PLACE, TP_SUBMITTING, TP_CANCELLED
+                    }
+                    for row in rows
+                )
                 dust_tps = sum(row["tp_status"] == TP_DUST for row in rows)
                 print(
                     f"[{now_text()}] 当前价={current}，"
@@ -1140,12 +1740,12 @@ def run_grid(
                 if failures >= 5:
                     raise RuntimeError("连续 5 轮失败，自动停止数据库网格") from exc
             if max_cycles is None or cycle < max_cycles:
-                time.sleep(poll_interval)
+                stop.wait(poll_interval)
     except KeyboardInterrupt:
         print("\n收到停止信号；数据库已保存，现有挂单不会自动撤销。")
     finally:
         stop.set()
-        if checker.is_alive():
+        if checker.is_alive() or listener.is_alive():
             shutdown_timeout = (
                 NETWORK_RETRY_ATTEMPTS * NETWORK_TIMEOUT[1]
                 + sum(0.5 * (2 ** attempt)
@@ -1153,9 +1753,11 @@ def run_grid(
                 + 2
             )
             checker.join(timeout=shutdown_timeout)
-        if checker.is_alive():
-            print(f"[{now_text()}] 查单线程仍在退出中，暂不关闭其客户端")
+            listener.join(timeout=shutdown_timeout)
+        if checker.is_alive() or listener.is_alive():
+            print(f"[{now_text()}] 异步线程仍在退出中，暂不关闭其客户端")
         else:
+            listener_client.close()
             checker_client.close()
             store.close()
             process_lock.release()
@@ -1170,7 +1772,8 @@ def run_SOXLG() -> None:
         leverage="2",
         buy_grid_count=10,
         take_profit_count=10,
-        take_profit_grid_count=20,
+        take_profit_grid_count=10,
+        max_unclosed_per_grid=2,  # 单个网格价位最多保留的已成交未止盈周期数
         grid_step_pct="0.003",
         take_profit_pct="0.003",
         auto_borrow=True,

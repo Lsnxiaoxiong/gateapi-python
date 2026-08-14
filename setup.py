@@ -21,7 +21,13 @@ VERSION = "7.2.123"
 # prerequisite: setuptools
 # http://pypi.python.org/pypi/setuptools
 
-REQUIRES = ["urllib3 >= 1.15", "six >= 1.10", "certifi", "python-dateutil"]
+REQUIRES = [
+    "urllib3 >= 1.15",
+    "six >= 1.10",
+    "certifi",
+    "python-dateutil",
+    "websocket-client >= 1.8.0",
+]
 
 setup(
     name=NAME,

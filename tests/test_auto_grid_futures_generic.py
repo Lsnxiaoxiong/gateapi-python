@@ -1,5 +1,9 @@
 from decimal import Decimal
+import hashlib
+import hmac
+import json
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import patch
 import tempfile
@@ -15,6 +19,7 @@ class DatabaseGridTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.store = grid.GridStore(Path(self.temp.name) / "grid.sqlite3")
+        self.next_order_id = 0
         self.spec = grid.PairSpec(
             "ETH", "USDT", Decimal("0.001"), Decimal("0.01"),
             Decimal("0.001"), Decimal("3"), Decimal("1000"), Decimal("1000000")
@@ -24,8 +29,10 @@ class DatabaseGridTest(unittest.TestCase):
         self.store.close()
         self.temp.cleanup()
 
-    @staticmethod
-    def gate_order(order_id="1", text="t-test"):
+    def gate_order(self, order_id=None, text="t-test"):
+        if order_id is None:
+            self.next_order_id += 1
+            order_id = str(self.next_order_id)
         return SimpleNamespace(id=order_id, text=text)
 
     def insert(self, pair="ETH_USDT", code="code", price="100", size="0.03"):
@@ -53,7 +60,8 @@ class DatabaseGridTest(unittest.TestCase):
         self.insert()
         row = self.store.active("ETH_USDT", "code")[0]
         self.assertEqual(grid.WAIT_BUY, row["buy_status"])
-        self.assertEqual(grid.TP_PLANNED, row["tp_status"])
+        self.assertEqual(grid.POSITION_NO_TP, row["position_status"])
+        self.assertEqual(grid.TP_NOT_SET, row["tp_status"])
         self.assertFalse(row["completed"])
 
     def test_buy_fill_advances_to_waiting_take_profit(self):
@@ -65,7 +73,8 @@ class DatabaseGridTest(unittest.TestCase):
         grid.mark_buy_result(self.store, row, result)
         updated = self.store.active("ETH_USDT", "code")[0]
         self.assertEqual(grid.BUY_FILLED, updated["buy_status"])
-        self.assertEqual(grid.TP_NOT_SET, updated["tp_status"])
+        self.assertEqual(grid.POSITION_WAIT_TP_ORDER, updated["position_status"])
+        self.assertEqual(grid.TP_WAIT_PLACE, updated["tp_status"])
 
     def test_take_profit_fill_completes_cycle(self):
         self.insert()
@@ -81,6 +90,7 @@ class DatabaseGridTest(unittest.TestCase):
         )
         completed = self.store.rows("SELECT * FROM grid_cycles WHERE id=?", (row["id"],))[0]
         self.assertEqual(grid.TP_FILLED, completed["tp_status"])
+        self.assertEqual(grid.POSITION_TP_FILLED, completed["position_status"])
         self.assertTrue(completed["completed"])
 
     def test_cancelled_zero_fill_buy_is_not_mistaken_for_a_fill(self):
@@ -108,7 +118,25 @@ class DatabaseGridTest(unittest.TestCase):
         )
         updated = self.store.active("ETH_USDT", "code")[0]
         self.assertEqual("0.02", updated["remaining_size"])
-        self.assertEqual(grid.TP_NOT_SET, updated["tp_status"])
+        self.assertEqual(grid.TP_WAIT_PLACE, updated["tp_status"])
+
+    def test_duplicate_partial_take_profit_event_is_idempotent(self):
+        self.insert()
+        row = self.store.active("ETH_USDT", "code")[0]
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,tp_status=?,tp_order_id='2' "
+            "WHERE id=?",
+            (grid.BUY_FILLED, grid.TP_OPEN, row["id"]),
+        )
+        stale = self.store.active("ETH_USDT", "code")[0]
+        result = SimpleNamespace(
+            status="cancelled", finish_as="cancelled", filled_amount="0.01"
+        )
+        grid.mark_tp_result(self.store, stale, result)
+        grid.mark_tp_result(self.store, stale, result)
+        updated = self.store.active("ETH_USDT", "code")[0]
+        self.assertEqual("0.02", updated["remaining_size"])
+        self.assertIsNone(updated["tp_order_id"])
 
     def test_same_price_two_unfinished_positions_blocks_new_buy(self):
         first = self.insert(price="100")
@@ -121,19 +149,97 @@ class DatabaseGridTest(unittest.TestCase):
             "ETH_USDT", "code", Decimal("100")
         ))
 
+    def test_main_buy_placement_skips_grid_with_two_unfinished_exposures(self):
+        first = self.insert(price="100")
+        second = self.insert(price="100")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,position_status=?,tp_status=? "
+            "WHERE id IN (?,?)",
+            (
+                grid.BUY_FILLED, grid.POSITION_WAIT_TP_ORDER,
+                grid.TP_WAIT_PLACE, first, second,
+            ),
+        )
+
+        class FakeApi:
+            def create_order(self, *args, **kwargs):
+                raise AssertionError("同一网格已有2个未止盈持仓时不应继续挂买单")
+
+        funded = grid.place_missing_buys(
+            FakeApi(), self.store, "ETH_USDT", "code",
+            [grid.PlannedOrder(Decimal("100"), Decimal("0.03"))],
+            Decimal("0.003"), self.spec, True, "db",
+        )
+        self.assertTrue(funded)
+        self.assertEqual(2, self.store.exposure_count(
+            "ETH_USDT", "code", Decimal("100")
+        ))
+
+    def test_configured_limit_three_allows_third_grid_cycle(self):
+        first = self.insert(price="100")
+        second = self.insert(price="100")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,position_status=?,tp_status=? "
+            "WHERE id IN (?,?)",
+            (
+                grid.BUY_FILLED, grid.POSITION_WAIT_TP_ORDER,
+                grid.TP_WAIT_PLACE, first, second,
+            ),
+        )
+
+        test_case = self
+
+        class FakeApi:
+            def create_order(self, *args, **kwargs):
+                return test_case.gate_order()
+
+        funded = grid.place_missing_buys(
+            FakeApi(), self.store, "ETH_USDT", "code",
+            [grid.PlannedOrder(Decimal("100"), Decimal("0.03"))],
+            Decimal("0.003"), self.spec, True, "db",
+            max_unclosed_per_grid=3,
+        )
+        self.assertTrue(funded)
+        self.assertEqual(3, len(self.store.active("ETH_USDT", "code")))
+
+    def test_grid_checker_cancels_pending_buy_after_two_exposures_accumulate(self):
+        first = self.insert(price="100")
+        second = self.insert(price="100")
+        pending = self.insert(price="100")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,position_status=?,tp_status=? "
+            "WHERE id IN (?,?)",
+            (
+                grid.BUY_FILLED, grid.POSITION_WAIT_TP_ORDER,
+                grid.TP_WAIT_PLACE, first, second,
+            ),
+        )
+
+        class FakeApi:
+            def cancel_order(self, *args, **kwargs):
+                return SimpleNamespace(status="cancelled", filled_amount="0")
+
+        grid.trim_outside_grid(
+            FakeApi(), self.store, "ETH_USDT", "code", {Decimal("100")}
+        )
+        self.assertIsNone(self.store.one(pending))
+        self.assertEqual(2, self.store.exposure_count(
+            "ETH_USDT", "code", Decimal("100")
+        ))
+
     def test_pending_legs_sorted_by_distance(self):
         self.insert(price="90")
         self.insert(price="99")
         legs = self.store.pending_legs("ETH_USDT", "code", Decimal("100"))
         self.assertEqual(Decimal("99"), legs[0][2])
 
-    def test_only_low_side_is_trimmed_when_window_moves(self):
+    def test_all_open_buys_outside_current_window_are_trimmed(self):
         low = self.insert(price="90")
         high = self.insert(price="110")
 
         class FakeApi:
             def cancel_order(self, *args, **kwargs):
-                return SimpleNamespace(filled_amount="0")
+                return SimpleNamespace(status="cancelled", filled_amount="0")
 
         grid.trim_outside_grid(
             FakeApi(), self.store, "ETH_USDT", "code",
@@ -141,21 +247,21 @@ class DatabaseGridTest(unittest.TestCase):
         )
         ids = {row["id"] for row in self.store.active("ETH_USDT", "code")}
         self.assertNotIn(low, ids)
-        self.assertIn(high, ids)
+        self.assertNotIn(high, ids)
 
     def test_partially_filled_trimmed_buy_is_preserved(self):
         row_id = self.insert(price="90", size="0.03")
 
         class FakeApi:
             def cancel_order(self, *args, **kwargs):
-                return SimpleNamespace(filled_amount="0.01")
+                return SimpleNamespace(status="cancelled", filled_amount="0.01")
 
         grid.trim_outside_grid(
             FakeApi(), self.store, "ETH_USDT", "code", {Decimal("100")}
         )
         row = self.store.rows("SELECT * FROM grid_cycles WHERE id=?", (row_id,))[0]
         self.assertEqual(grid.BUY_FILLED, row["buy_status"])
-        self.assertEqual(grid.TP_NOT_SET, row["tp_status"])
+        self.assertEqual(grid.TP_WAIT_PLACE, row["tp_status"])
         self.assertEqual("0.01", row["remaining_size"])
 
     def test_grid_math_and_take_profit_rounding(self):
@@ -224,7 +330,7 @@ class DatabaseGridTest(unittest.TestCase):
             "SELECT * FROM grid_cycles WHERE id=?", (far_id,)
         )[0]
         self.assertEqual(grid.WAIT_TP, near["tp_status"])
-        self.assertEqual(grid.TP_NOT_SET, far["tp_status"])
+        self.assertEqual(grid.TP_WAIT_PLACE, far["tp_status"])
 
     def test_tp_outside_price_window_is_cancelled(self):
         far_id = self.insert(price="110", size="0.03")
@@ -245,7 +351,7 @@ class DatabaseGridTest(unittest.TestCase):
         row = self.store.rows(
             "SELECT * FROM grid_cycles WHERE id=?", (far_id,)
         )[0]
-        self.assertEqual(grid.TP_NOT_SET, row["tp_status"])
+        self.assertEqual(grid.TP_WAIT_PLACE, row["tp_status"])
         self.assertIsNone(row["tp_order_id"])
 
     def test_subminimum_take_profit_is_marked_as_dust_and_not_submitted(self):
@@ -344,6 +450,149 @@ class DatabaseGridTest(unittest.TestCase):
         )
         self.assertEqual(0, count)
 
+    def test_order_listener_drives_buy_fill_to_take_profit_fill(self):
+        self.insert(price="100", size="0.03")
+
+        class FakeApi:
+            def __init__(self):
+                self.created = []
+
+            def create_order(self, order, **kwargs):
+                self.created.append(order)
+                return SimpleNamespace(id="tp-1", text=order.text)
+
+        api = FakeApi()
+        listener = grid.OrderListener(
+            grid.threading.Event(), self.store, api, "ETH_USDT", "code",
+            self.spec, Decimal("0.003"), "db", "dt", "wss://example.test/ws",
+        )
+        handled = listener.handle_order_update({
+            "id": "1",
+            "text": "t-test",
+            "currency_pair": "ETH_USDT",
+            "account": "margin",
+            "side": "buy",
+            "status": "closed",
+            "filled_amount": "0.03",
+            "amount": "0.03",
+            "left": "0",
+        })
+        self.assertTrue(handled)
+        self.assertEqual(1, len(api.created))
+        row = self.store.active("ETH_USDT", "code")[0]
+        self.assertEqual(grid.BUY_FILLED, row["buy_status"])
+        self.assertEqual(grid.POSITION_WAIT_TP, row["position_status"])
+        self.assertEqual(grid.TP_OPEN, row["tp_status"])
+        self.assertEqual("tp-1", row["tp_order_id"])
+
+        # 重复成交推送必须幂等，不能重复挂止盈。
+        listener.handle_order_update({
+            "id": "1", "text": "t-test", "currency_pair": "ETH_USDT",
+            "account": "margin", "side": "buy", "status": "closed",
+            "filled_amount": "0.03", "amount": "0.03", "left": "0",
+        })
+        self.assertEqual(1, len(api.created))
+
+        listener.handle_order_update({
+            "id": "tp-1",
+            "text": api.created[0].text,
+            "currency_pair": "ETH_USDT",
+            "account": "margin",
+            "side": "sell",
+            "status": "closed",
+            "filled_amount": "0.03",
+            "amount": "0.03",
+            "left": "0",
+        })
+        completed = self.store.rows(
+            "SELECT * FROM grid_cycles WHERE id=?", (row["id"],)
+        )[0]
+        self.assertTrue(completed["completed"])
+        self.assertEqual(grid.POSITION_TP_FILLED, completed["position_status"])
+        self.assertEqual(grid.TP_FILLED, completed["tp_status"])
+
+    def test_order_listener_idempotently_adds_missing_open_buy_record(self):
+        listener = grid.OrderListener(
+            grid.threading.Event(), self.store, object(), "ETH_USDT", "code",
+            self.spec, Decimal("0.005"), "db", "dt",
+            "wss://example.test/ws",
+        )
+        event = {
+            "id": "missing-buy",
+            "text": "t-dbcode-recovered",
+            "currency_pair": "ETH_USDT",
+            "account": "margin",
+            "side": "buy",
+            "status": "open",
+            "filled_amount": "0",
+            "amount": "0.03",
+            "left": "0.03",
+            "price": "100",
+        }
+        listener._receive_event(event)
+        rows = self.store.active("ETH_USDT", "code")
+        self.assertEqual(1, len(rows))
+        self.assertEqual(grid.BUY_OPEN, rows[0]["buy_status"])
+        self.assertEqual(grid.POSITION_NO_TP, rows[0]["position_status"])
+        self.assertEqual(grid.TP_NOT_SET, rows[0]["tp_status"])
+        self.assertEqual("100.5", rows[0]["tp_price"])
+
+        same_id = self.store.insert_buy(
+            "ETH_USDT", "code",
+            SimpleNamespace(id="missing-buy", text="t-dbcode-recovered"),
+            grid.PlannedOrder(Decimal("100"), Decimal("0.03")),
+            Decimal("100.5"),
+        )
+        self.assertEqual(rows[0]["id"], same_id)
+        self.assertEqual(1, len(self.store.active("ETH_USDT", "code")))
+
+    def test_take_profit_claim_prevents_duplicate_submission(self):
+        row_id = self.insert(price="100", size="0.03")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,position_status=?,tp_status=? "
+            "WHERE id=?",
+            (
+                grid.BUY_FILLED, grid.POSITION_WAIT_TP_ORDER,
+                grid.TP_WAIT_PLACE, row_id,
+            ),
+        )
+        self.assertTrue(self.store.claim_take_profit(row_id))
+        self.assertFalse(self.store.claim_take_profit(row_id))
+
+    def test_stale_take_profit_claim_can_be_recovered_after_reconciliation(self):
+        row_id = self.insert(price="100", size="0.03")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,position_status=?,tp_status=?,"
+            "updated_at=0 WHERE id=?",
+            (
+                grid.BUY_FILLED, grid.POSITION_WAIT_TP_ORDER,
+                grid.TP_SUBMITTING, row_id,
+            ),
+        )
+        recovered = self.store.recover_stale_take_profit_claims(
+            "ETH_USDT", "code", 60
+        )
+        self.assertEqual(1, recovered)
+        row = self.store.one(row_id)
+        self.assertEqual(grid.TP_WAIT_PLACE, row["tp_status"])
+        self.assertEqual(grid.POSITION_WAIT_TP_ORDER, row["position_status"])
+
+    def test_order_listener_subscription_is_signed_for_current_pair(self):
+        listener = grid.OrderListener(
+            grid.threading.Event(), self.store, object(), "ETH_USDT", "code",
+            self.spec, Decimal("0.003"), "db", "dt", "wss://example.test/ws",
+        )
+        with patch.object(grid.time, "time", return_value=1234567890):
+            message = json.loads(listener._subscription("key", "secret"))
+        expected = hmac.new(
+            b"secret",
+            b"channel=spot.orders&event=subscribe&time=1234567890",
+            hashlib.sha512,
+        ).hexdigest()
+        self.assertEqual(["ETH_USDT"], message["payload"])
+        self.assertEqual("spot.orders", message["channel"])
+        self.assertEqual(expected, message["auth"]["SIGN"])
+
     def test_proxy_and_internal_retry_configuration(self):
         with patch.dict("os.environ", {"GATE_PROXY": "http://127.0.0.1:7890"}):
             config = grid.make_configuration("https://example.test")
@@ -358,6 +607,8 @@ class DatabaseGridTest(unittest.TestCase):
         first = grid.strategy_code(*args)
         changed = grid.strategy_code(*args[:-2], Decimal("3"), args[-1])
         self.assertNotEqual(first, changed)
+        changed_limit = grid.strategy_code(*args, max_unclosed_per_grid=3)
+        self.assertNotEqual(first, changed_limit)
 
     def test_process_lock_rejects_second_instance(self):
         path = Path(self.temp.name) / "ETH_USDT.lock"
@@ -371,6 +622,40 @@ class DatabaseGridTest(unittest.TestCase):
             first.release()
         second.acquire()
         second.release()
+
+    def test_reset_ignores_orders_already_missing_from_gate(self):
+        self.insert(price="100")
+        tp_row_id = self.insert(price="99")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,position_status=?,tp_status=?,"
+            "tp_order_id='missing-tp' WHERE id=?",
+            (
+                grid.BUY_FILLED, grid.POSITION_WAIT_TP, grid.TP_OPEN, tp_row_id,
+            ),
+        )
+
+        class FakeApi:
+            def __init__(self):
+                self.cancelled = []
+
+            def cancel_order(self, order_id, *args, **kwargs):
+                self.cancelled.append(str(order_id))
+                parent = grid.ApiException(status=404, reason="Not Found")
+                raise grid.GateApiException(
+                    "ORDER_NOT_FOUND", "Order not found", exp=parent
+                )
+
+            def get_order(self, *args, **kwargs):
+                raise AssertionError("reset 模式不应再次查询已不存在的订单")
+
+        api = FakeApi()
+        grid.reset_pair(api, self.store, "ETH_USDT")
+        self.assertEqual(2, len(api.cancelled))
+        self.assertEqual(
+            [], self.store.rows(
+                "SELECT * FROM grid_cycles WHERE currency_pair='ETH_USDT'"
+            )
+        )
 
     def test_margin_startup_enables_auto_repay(self):
         class FakeMarginApi:
@@ -391,6 +676,64 @@ class DatabaseGridTest(unittest.TestCase):
         )
         self.assertEqual("2", api.leverage)
         self.assertEqual("on", api.auto_repay)
+
+    def test_old_database_statuses_are_migrated_to_new_state_machine(self):
+        path = Path(self.temp.name) / "old.sqlite3"
+        db = sqlite3.connect(path)
+        db.executescript(
+            """
+            CREATE TABLE grid_cycles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                currency_pair TEXT NOT NULL,
+                strategy_code TEXT NOT NULL,
+                buy_price TEXT NOT NULL,
+                buy_size TEXT NOT NULL,
+                remaining_size TEXT NOT NULL,
+                buy_order_id TEXT,
+                buy_order_text TEXT,
+                buy_status TEXT NOT NULL,
+                tp_price TEXT NOT NULL,
+                tp_order_id TEXT,
+                tp_order_text TEXT,
+                tp_status TEXT NOT NULL,
+                in_grid INTEGER NOT NULL DEFAULT 1,
+                completed INTEGER NOT NULL DEFAULT 0,
+                last_checked_at REAL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            INSERT INTO grid_cycles(
+                currency_pair,strategy_code,buy_price,buy_size,remaining_size,
+                buy_order_id,buy_status,tp_price,tp_status,created_at,updated_at
+            ) VALUES
+                ('ETH_USDT','code','100','0.03','0.03','buy-open',
+                 '等待买单成交','100.3','已设置止盈单',0,0),
+                ('ETH_USDT','code','99','0.03','0.03','buy-filled',
+                 '买单成交','99.3','未设置止盈、等待设置止盈',0,0);
+            """
+        )
+        db.commit()
+        db.close()
+
+        migrated = grid.GridStore(path)
+        try:
+            rows = migrated.active("ETH_USDT", "code")
+            by_id = {row["buy_order_id"]: row for row in rows}
+            self.assertEqual(grid.BUY_OPEN, by_id["buy-open"]["buy_status"])
+            self.assertEqual(
+                grid.POSITION_NO_TP, by_id["buy-open"]["position_status"]
+            )
+            self.assertEqual(grid.TP_NOT_SET, by_id["buy-open"]["tp_status"])
+            self.assertEqual(grid.BUY_FILLED, by_id["buy-filled"]["buy_status"])
+            self.assertEqual(
+                grid.POSITION_WAIT_TP_ORDER,
+                by_id["buy-filled"]["position_status"],
+            )
+            self.assertEqual(
+                grid.TP_WAIT_PLACE, by_id["buy-filled"]["tp_status"]
+            )
+        finally:
+            migrated.close()
 
 
 if __name__ == "__main__":

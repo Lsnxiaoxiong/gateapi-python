@@ -4,6 +4,37 @@ This is a demo application using `gate-api` to show how Gate APIv4 works.
 Instead of running it, it is recommended to read the source code to get a general idea of
 how this SDK is used. However, you can modify this code directly to implement your own logic.
 
+## USDT 永续合约数据库网格
+
+`auto_grid_contract_futures_generic.py` 是独立的 USDT 永续合约入口。它复用
+现有 SQLite 网格状态机，但订单全部通过 `FuturesApi` 提交，默认合约为
+`SOXL_USDT`。数据库中的数量代表合约张数，止盈卖单使用负张数并强制
+`reduce_only=True`。
+
+先在 `example/.env` 或项目根目录 `.env` 配置：
+
+```ini
+GATE_API_KEY=...
+GATE_API_SECRET=...
+GATE_USER_ID=...
+# 可选：GATE_PROXY=http://127.0.0.1:7890
+```
+
+不设置实盘确认值时只读取公开合约规格和行情并打印预览：
+
+```bash
+python example/auto_grid_contract_futures_generic.py
+```
+
+确认账户使用单向持仓模式、参数及预览无误后，实盘确认值为：
+
+```ini
+GATE_LIVE_CONFIRM=RUN_REAL_FUTURES_DB_GRID
+```
+
+合约网格使用独立数据库 `example/futures_grid_orders.sqlite3`，不会读取现货
+杠杆网格的 `grid_orders.sqlite3`。
+
 ## Build
 
 1. Clone this project and make sure it is named with `gateapi-python`
@@ -61,11 +92,21 @@ buy, but the real sell order is submitted only after that buy fills. Stopping it
 existing orders; use the same parameters with `resume` on the next start. If unfinished rows
 belong to different parameters, `resume` stops and requires an explicit `reset`.
 
-The take-profit window defaults to the nearest 20 anchored grid intervals above the current
-price. When the configured take-profit order limit is full, nearer eligible exits replace farther
-ones. Order reconciliation uses one open-order list request and one finished-order list request
-every 0.5 seconds, with an individual lookup only as a fallback for records absent from both
-snapshots.
+The take-profit window defaults to the nearest 10 anchored grid intervals above the current
+price. `GridChecker` cancels buy and take-profit orders outside their current 10-grid windows;
+when the take-profit limit is full, nearer eligible exits replace farther ones. `OrderListener`
+subscribes to Gate's authenticated `spot.orders` WebSocket channel and updates SQLite on order
+creation, fill, close, and cancellation. REST open/finished snapshots run only at startup, after
+reconnection, and every 30 seconds as loss-recovery checks.
+
+The persisted cycle states now follow this sequence:
+
+```text
+buy_status=已挂单、未成交 | position_status=未设置止盈单 | tp_status=未设置止盈单
+buy_status=已成交         | position_status=等待挂止盈单 | tp_status=等待挂单
+buy_status=已成交         | position_status=已设置止盈、等待止盈 | tp_status=止盈单已挂单
+buy_status=已成交         | position_status=止盈已成交 | tp_status=止盈已成交
+```
 A per-database, per-pair process lock prevents two processes from maintaining the same grid.
 Live startup explicitly enables and verifies the account-level isolated-margin auto-repayment
 setting when `auto_repay=True` (the default).
