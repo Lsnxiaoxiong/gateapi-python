@@ -1,0 +1,4 @@
+scp -P 23334 D:\source\python-okx\demo\auto_grid_btc_usdt_swap.py root@192.168.30.102:/usr/app/auto_grid_btc_usdt_swap.py
+scp -P 23334 D:\source\gateapi-python\example\* root@192.168.30.102:/usr/app/example/
+scp -r -P 23334 D:\source\gateapi-python\* root@192.168.30.102:/usr/app/
+scp -P 23334 D:\source\gateapi-python\example\.env root@192.168.30.102:/usr/app/example/.env
