@@ -50,9 +50,9 @@ NETWORK_RETRY_ATTEMPTS = 3
 BALANCE_RETRY_INTERVAL = 30
 CHECK_BATCH_INTERVAL = 0.5
 GRID_CHECK_INTERVAL = 1.0
-REST_RECONCILE_INTERVAL = 30.0
+ORDER_STATE_CHECK_INTERVAL = 1.0
 WEBSOCKET_RECONNECT_INTERVAL = 2.0
-TP_SUBMISSION_STALE_SECONDS = REST_RECONCILE_INTERVAL * 2
+TP_SUBMISSION_STALE_SECONDS = 60.0
 ORDER_SNAPSHOT_LIMIT = 100
 ORPHAN_ORDER_GRACE_SECONDS = 15
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -607,6 +607,53 @@ class GridStore:
             if cursor.rowcount != 1:
                 raise RuntimeError(f"止盈挂单写库抢占已失效：记录={row_id}")
 
+    def attach_missing_take_profit(
+        self,
+        pair: str,
+        code: str,
+        order_id: str,
+        order_text: str,
+        price: Decimal,
+        size: Decimal,
+    ) -> Optional[sqlite3.Row]:
+        """恢复已在 Gate 挂出、但进程崩溃前尚未来得及写库的止盈单。"""
+        with self.lock:
+            existing = self.db.execute(
+                "SELECT * FROM grid_cycles WHERE currency_pair=? "
+                "AND strategy_code=? AND tp_order_id=? LIMIT 1",
+                (pair, code, str(order_id)),
+            ).fetchone()
+            if existing:
+                return existing
+            candidate = self.db.execute(
+                "SELECT * FROM grid_cycles WHERE currency_pair=? "
+                "AND strategy_code=? AND completed=0 AND buy_status=? "
+                "AND tp_order_id IS NULL AND tp_price=? AND remaining_size=? "
+                "AND tp_status IN (?,?,?,?) ORDER BY updated_at,id LIMIT 1",
+                (
+                    pair, code, BUY_FILLED, decimal_text(price),
+                    decimal_text(size), TP_SUBMITTING, TP_WAIT_PLACE,
+                    TP_NOT_SET, TP_CANCELLED,
+                ),
+            ).fetchone()
+            if candidate is None:
+                return None
+            cursor = self.db.execute(
+                "UPDATE grid_cycles SET tp_order_id=?,tp_order_text=?,"
+                "tp_status=?,position_status=?,updated_at=? WHERE id=? "
+                "AND completed=0 AND tp_order_id IS NULL",
+                (
+                    str(order_id), str(order_text or ""), TP_OPEN,
+                    POSITION_WAIT_TP, time.time(), candidate["id"],
+                ),
+            )
+            self.db.commit()
+            if cursor.rowcount != 1:
+                return None
+            return self.db.execute(
+                "SELECT * FROM grid_cycles WHERE id=?", (candidate["id"],)
+            ).fetchone()
+
     def insert_buy(
         self, pair: str, code: str, order, planned: PlannedOrder, tp: Decimal
     ) -> int:
@@ -985,6 +1032,27 @@ class OrderListener:
         )
         return True
 
+    def _attach_missing_take_profit(self, event: dict) -> bool:
+        if str(event.get("side", "")) != "sell":
+            return False
+        try:
+            price = decimal_value("止盈卖单价格", event.get("price"))
+            size = decimal_value("止盈卖单数量", event.get("amount"))
+        except ValueError:
+            return False
+        row = self.store.attach_missing_take_profit(
+            self.pair, self.code, str(event.get("id", "")),
+            str(event.get("text", "") or ""), price, size,
+        )
+        if row is None:
+            return False
+        print(
+            f"[{now_text()}] OrderStateChecker 恢复止盈卖单关联："
+            f"记录={row['id']}，卖价={price}，数量={size}，"
+            f"id={event.get('id', '')}"
+        )
+        return True
+
     def handle_order_update(self, event: dict) -> bool:
         """处理一个订单事件；返回是否找到并更新了对应数据库周期。"""
         if str(event.get("currency_pair", "")) != self.pair:
@@ -1022,6 +1090,12 @@ class OrderListener:
 
     def _receive_event(self, event: dict) -> None:
         if self.handle_order_update(event):
+            return
+        if (
+            self._belongs_to_strategy(event)
+            and self._attach_missing_take_profit(event)
+            and self.handle_order_update(event)
+        ):
             return
         if (
             self._belongs_to_strategy(event)
@@ -1133,10 +1207,6 @@ class OrderListener:
             )
             self.stop.set()
             return
-        try:
-            self.reconcile_rest(exact_missing=True)
-        except Exception as exc:
-            print(f"[{now_text()}] OrderListener 启动校验失败：{exc}")
         while not self.stop.is_set():
             ws = None
             try:
@@ -1147,7 +1217,6 @@ class OrderListener:
                 )
                 ws.send(self._subscription(api_key, api_secret))
                 ws.settimeout(1)
-                last_rest = time.monotonic()
                 last_ping = time.monotonic()
                 print(
                     f"[{now_text()}] OrderListener 已订阅 "
@@ -1173,16 +1242,9 @@ class OrderListener:
                     if now - last_ping >= 20:
                         ws.ping()
                         last_ping = now
-                    if now - last_rest >= REST_RECONCILE_INTERVAL:
-                        self.reconcile_rest()
-                        last_rest = now
             except Exception as exc:
                 if not self.stop.is_set():
                     print(f"[{now_text()}] OrderListener 断线：{exc}；准备重连")
-                    try:
-                        self.reconcile_rest(exact_missing=True)
-                    except Exception as reconcile_exc:
-                        print(f"[{now_text()}] OrderListener 断线补查失败：{reconcile_exc}")
                     self.stop.wait(WEBSOCKET_RECONNECT_INTERVAL)
             finally:
                 if ws is not None:
@@ -1190,6 +1252,41 @@ class OrderListener:
                         ws.close()
                     except Exception:
                         pass
+
+
+class OrderStateChecker:
+    """唯一的 REST 订单对账线程，每秒把 Gate 实际状态同步到数据库。"""
+
+    def __init__(
+        self,
+        stop: threading.Event,
+        reconciler: OrderListener,
+        interval: float = ORDER_STATE_CHECK_INTERVAL,
+    ):
+        if interval <= 0:
+            raise ValueError("订单状态检查间隔必须大于 0")
+        self.stop = stop
+        self.reconciler = reconciler
+        self.interval = interval
+
+    def run(self) -> None:
+        print(
+            f"[{now_text()}] OrderStateChecker 已启动："
+            f"每 {self.interval:g} 秒同步一次订单状态"
+        )
+        while not self.stop.is_set():
+            started = time.monotonic()
+            try:
+                # 先批量查询 open/finished；数据库未完成但不在快照中的订单按 ID 补查。
+                self.reconciler.reconcile_rest(exact_missing=True)
+            except Exception as exc:
+                detail = (
+                    f"label={exc.label}, message={exc.message}"
+                    if isinstance(exc, GateApiException) else str(exc)
+                )
+                print(f"[{now_text()}] OrderStateChecker 对账失败：{detail}")
+            elapsed = time.monotonic() - started
+            self.stop.wait(max(0, self.interval - elapsed))
 
 
 class GridChecker:
@@ -1617,13 +1714,16 @@ def run_grid(
     main_client = ApiClient(make_configuration(host, api_key, api_secret))
     checker_client = ApiClient(make_configuration(host, api_key, api_secret))
     listener_client = ApiClient(make_configuration(host, api_key, api_secret))
+    state_client = ApiClient(make_configuration(host, api_key, api_secret))
     api = SpotApi(main_client)
     checker_api = SpotApi(checker_client)
     listener_api = SpotApi(listener_client)
+    state_api = SpotApi(state_client)
     margin_api = MarginApi(main_client)
     try:
         process_lock.acquire()
     except Exception:
+        state_client.close()
         listener_client.close()
         checker_client.close()
         main_client.close()
@@ -1632,6 +1732,7 @@ def run_grid(
         store = GridStore(Path(database_path))
     except Exception:
         process_lock.release()
+        state_client.close()
         listener_client.close()
         checker_client.close()
         main_client.close()
@@ -1652,6 +1753,11 @@ def run_grid(
         stop, store, listener_api, pair, code, spec, tp_pct,
         buy_client_order_prefix, sell_client_order_prefix, ws_url,
     )
+    state_reconciler = OrderListener(
+        stop, store, state_api, pair, code, spec, tp_pct,
+        buy_client_order_prefix, sell_client_order_prefix, ws_url,
+    )
+    order_state_checker = OrderStateChecker(stop, state_reconciler)
     checker = threading.Thread(
         target=grid_checker.run,
         name=f"grid-check-{pair}",
@@ -1661,6 +1767,11 @@ def run_grid(
         target=order_listener.run,
         args=(api_key, api_secret),
         name=f"order-listener-{pair}",
+        daemon=True,
+    )
+    state_sync = threading.Thread(
+        target=order_state_checker.run,
+        name=f"order-state-check-{pair}",
         daemon=True,
     )
     try:
@@ -1680,6 +1791,7 @@ def run_grid(
                     f"数据库中存在 {pair} 的其他未完成策略：{details}。"
                     "当前参数不能安全恢复；确认撤销旧策略后请使用 startup_mode='reset'。"
                 )
+        state_sync.start()
         listener.start()
         checker.start()
         print(
@@ -1745,7 +1857,7 @@ def run_grid(
         print("\n收到停止信号；数据库已保存，现有挂单不会自动撤销。")
     finally:
         stop.set()
-        if checker.is_alive() or listener.is_alive():
+        if checker.is_alive() or listener.is_alive() or state_sync.is_alive():
             shutdown_timeout = (
                 NETWORK_RETRY_ATTEMPTS * NETWORK_TIMEOUT[1]
                 + sum(0.5 * (2 ** attempt)
@@ -1754,9 +1866,11 @@ def run_grid(
             )
             checker.join(timeout=shutdown_timeout)
             listener.join(timeout=shutdown_timeout)
-        if checker.is_alive() or listener.is_alive():
+            state_sync.join(timeout=shutdown_timeout)
+        if checker.is_alive() or listener.is_alive() or state_sync.is_alive():
             print(f"[{now_text()}] 异步线程仍在退出中，暂不关闭其客户端")
         else:
+            state_client.close()
             listener_client.close()
             checker_client.close()
             store.close()

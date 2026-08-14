@@ -425,7 +425,7 @@ def run_grid(
     )
     clients = [
         ApiClient(make_configuration(host, api_key, api_secret))
-        for _ in range(3)
+        for _ in range(4)
     ]
     futures_apis = [FuturesApi(client) for client in clients]
     apis = [FuturesGridApi(api, settle) for api in futures_apis]
@@ -455,12 +455,23 @@ def run_grid(
         buy_client_order_prefix, sell_client_order_prefix, ws_url,
         user_id=user_id,
     )
+    state_reconciler = FuturesOrderListener(
+        stop, store, apis[3], contract, code, contract_spec.grid_spec, tp_pct,
+        buy_client_order_prefix, sell_client_order_prefix, ws_url,
+        user_id=user_id,
+    )
+    order_state_checker = core.OrderStateChecker(stop, state_reconciler)
     checker = threading.Thread(
         target=grid_checker.run, name=f"futures-grid-check-{contract}", daemon=True
     )
     listener = threading.Thread(
         target=order_listener.run, args=(api_key, api_secret),
         name=f"futures-order-listener-{contract}", daemon=True,
+    )
+    state_sync = threading.Thread(
+        target=order_state_checker.run,
+        name=f"futures-order-state-check-{contract}",
+        daemon=True,
     )
     try:
         mode = configure_futures_account(
@@ -475,6 +486,7 @@ def run_grid(
                     f"数据库中存在 {contract} 的其他未完成策略；"
                     "确认撤销旧策略后使用 startup_mode='reset'"
                 )
+        state_sync.start()
         listener.start()
         checker.start()
         print(
@@ -542,7 +554,8 @@ def run_grid(
         )
         checker.join(timeout=shutdown_timeout)
         listener.join(timeout=shutdown_timeout)
-        if checker.is_alive() or listener.is_alive():
+        state_sync.join(timeout=shutdown_timeout)
+        if checker.is_alive() or listener.is_alive() or state_sync.is_alive():
             print(
                 f"[{core.now_text()}] 合约异步线程仍在退出中，"
                 "暂不关闭其数据库和客户端"

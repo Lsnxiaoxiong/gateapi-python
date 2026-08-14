@@ -511,6 +511,123 @@ class DatabaseGridTest(unittest.TestCase):
         self.assertEqual(grid.POSITION_TP_FILLED, completed["position_status"])
         self.assertEqual(grid.TP_FILLED, completed["tp_status"])
 
+    def test_rest_reconciliation_recovers_missed_buy_and_take_profit_fills(self):
+        self.insert(price="100", size="0.03")
+
+        class Job:
+            def __init__(self, result):
+                self.result = result
+
+            def get(self):
+                return self.result
+
+        class FakeApi:
+            def __init__(self):
+                self.phase = "buy-filled"
+                self.created = []
+
+            @staticmethod
+            def order(order_id, side, status, filled, text, price):
+                return SimpleNamespace(
+                    id=order_id, text=text, currency_pair="ETH_USDT",
+                    account="margin", side=side, status=status,
+                    finish_as="filled" if status == "closed" else "",
+                    amount="0.03", left="0" if status == "closed" else "0.03",
+                    filled_amount=filled, price=price,
+                )
+
+            def list_orders(self, pair, status, **kwargs):
+                buy = self.order(
+                    "1", "buy", "closed", "0.03", "t-test", "100"
+                )
+                tp = self.order(
+                    "tp-1", "sell", "closed", "0.03",
+                    self.created[0].text if self.created else "t-dtcode",
+                    "100.3",
+                )
+                rows = []
+                if status == "finished":
+                    rows = [buy] if self.phase == "buy-filled" else [buy, tp]
+                return Job(rows)
+
+            def create_order(self, order, **kwargs):
+                self.created.append(order)
+                return SimpleNamespace(id="tp-1", text=order.text)
+
+            def get_order(self, order_id, pair, **kwargs):
+                return self.order(
+                    "tp-1", "sell", "open", "0", self.created[0].text,
+                    "100.3",
+                )
+
+        api = FakeApi()
+        reconciler = grid.OrderListener(
+            grid.threading.Event(), self.store, api, "ETH_USDT", "code",
+            self.spec, Decimal("0.003"), "db", "dt",
+            "wss://example.test/ws",
+        )
+        reconciler.reconcile_rest(exact_missing=True)
+        row = self.store.active("ETH_USDT", "code")[0]
+        self.assertEqual(grid.BUY_FILLED, row["buy_status"])
+        self.assertEqual(grid.TP_OPEN, row["tp_status"])
+        self.assertEqual("tp-1", row["tp_order_id"])
+
+        api.phase = "tp-filled"
+        reconciler.reconcile_rest(exact_missing=True)
+        completed = self.store.rows(
+            "SELECT * FROM grid_cycles WHERE id=?", (row["id"],)
+        )[0]
+        self.assertTrue(completed["completed"])
+        self.assertEqual(grid.TP_FILLED, completed["tp_status"])
+
+    def test_order_state_checker_runs_one_exact_reconciliation(self):
+        stop = grid.threading.Event()
+
+        class FakeReconciler:
+            def __init__(self):
+                self.calls = []
+
+            def reconcile_rest(self, exact_missing=False):
+                self.calls.append(exact_missing)
+                stop.set()
+
+        reconciler = FakeReconciler()
+        checker = grid.OrderStateChecker(stop, reconciler, interval=1)
+        checker.run()
+        self.assertEqual([True], reconciler.calls)
+
+    def test_order_state_checker_recovers_unwritten_open_take_profit(self):
+        row_id = self.insert(price="100", size="0.03")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,position_status=?,tp_status=? "
+            "WHERE id=?",
+            (
+                grid.BUY_FILLED, grid.POSITION_WAIT_TP_ORDER,
+                grid.TP_SUBMITTING, row_id,
+            ),
+        )
+        listener = grid.OrderListener(
+            grid.threading.Event(), self.store, object(), "ETH_USDT", "code",
+            self.spec, Decimal("0.003"), "db", "dt",
+            "wss://example.test/ws",
+        )
+        listener._receive_event({
+            "id": "tp-recovered",
+            "text": "t-dtcode-recovered",
+            "currency_pair": "ETH_USDT",
+            "account": "margin",
+            "side": "sell",
+            "status": "open",
+            "filled_amount": "0",
+            "amount": "0.03",
+            "left": "0.03",
+            "price": "100.3",
+        })
+        row = self.store.one(row_id)
+        self.assertEqual("tp-recovered", row["tp_order_id"])
+        self.assertEqual(grid.TP_OPEN, row["tp_status"])
+        self.assertEqual(grid.POSITION_WAIT_TP, row["position_status"])
+
     def test_order_listener_idempotently_adds_missing_open_buy_record(self):
         listener = grid.OrderListener(
             grid.threading.Event(), self.store, object(), "ETH_USDT", "code",

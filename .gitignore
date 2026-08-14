@@ -67,4 +67,4 @@ target/
 
 #Ipython Notebook
 .ipynb_checkpoints
-/example/.env
+/.env
