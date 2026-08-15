@@ -1,0 +1,21 @@
+[Unit]
+Description=Gate Grid Contract SKHYNIX Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+
+WorkingDirectory=/usr/app/gateapi-python-master/example
+
+ExecStart=/usr/bin/python3 -u /usr/app/gateapi-python-master/example/auto_grid_contract_SKHYNIX.py
+
+EnvironmentFile=/usr/app/gateapi-python-master/example/.env
+Environment=PYTHONUNBUFFERED=1
+
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

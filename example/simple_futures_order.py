@@ -17,11 +17,11 @@ from gate_api import ApiClient, Configuration, FuturesApi, FuturesOrder
 from gate_api.exceptions import GateApiException
 
 
-CONTRACT = "SOXL_USDT"
+CONTRACT = "SKHYNIX_USDT"
 SETTLE = "usdt"
 MARGIN_AMOUNT = "1.5"  # 预计占用的保证金，单位 USDT
 LEVERAGE = "2"       # 杠杆倍数
-PRICE = "140"        # 限价，单位 USDT
+PRICE = "10"        # 限价，单位 USDT
 LIVE_CONFIRM_TEXT = "PLACE_FUTURES_ORDER"
 
 
@@ -127,9 +127,13 @@ def main() -> None:
             return
 
         account = api.list_futures_accounts(SETTLE)
-        if account.in_dual_mode or account.position_mode in {"dual", "dual_plus"}:
-            raise RuntimeError("本示例只支持合约账户的单向持仓模式")
-        api.update_position_leverage(SETTLE, CONTRACT, LEVERAGE)
+        dual_mode = bool(account.in_dual_mode) or account.position_mode in {
+            "dual", "dual_plus"
+        }
+        if dual_mode:
+            api.update_dual_mode_position_leverage(SETTLE, CONTRACT, LEVERAGE)
+        else:
+            api.update_position_leverage(SETTLE, CONTRACT, LEVERAGE)
         order = FuturesOrder(
             contract=CONTRACT,
             size=decimal_text(size),  # 正数表示买入/做多

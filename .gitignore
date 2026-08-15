@@ -68,3 +68,7 @@ target/
 #Ipython Notebook
 .ipynb_checkpoints
 /.env
+/example/.env
+/example/futures_grid_orders.sqlite3
+/example/futures_grid_orders.sqlite3.usdt.SKHYNIX_USDT.lock
+/example/test.py

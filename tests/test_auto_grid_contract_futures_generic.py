@@ -1,6 +1,7 @@
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+import tempfile
 import sys
 
 
@@ -85,6 +86,23 @@ def test_take_profit_is_negative_and_reduce_only():
     assert result.side == "sell"
 
 
+def test_futures_order_list_request_filters_current_contract():
+    class RawApi:
+        def __init__(self):
+            self.calls = []
+
+        def list_futures_orders(self, settle, status, **kwargs):
+            self.calls.append((settle, status, kwargs))
+            return []
+
+    raw = RawApi()
+    api = futures_grid.FuturesGridApi(raw, "usdt")
+    assert api.list_orders("SOXL_USDT", "open") == []
+    assert raw.calls == [
+        ("usdt", "open", {"contract": "SOXL_USDT"})
+    ]
+
+
 def test_finished_futures_order_is_normalised_for_grid_state_machine():
     filled = futures_grid.FuturesGridApi._normalise(SimpleNamespace(
         id=1, contract="SOXL_USDT", size="-2", left="0", price="146",
@@ -118,3 +136,62 @@ def test_futures_websocket_event_is_normalised():
     assert event["left"] == "1"
     assert event["filled_amount"] == "2"
     assert event["status"] == "cancelled"
+
+
+def test_futures_buy_fill_does_not_place_take_profit_outside_window():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = core.GridStore(Path(temp_dir) / "futures-grid.sqlite3")
+        try:
+            store.insert_buy(
+                "SOXL_USDT", "code",
+                SimpleNamespace(id="buy-1", text="t-fbcode-buy"),
+                core.PlannedOrder(Decimal("100"), Decimal("2")),
+                Decimal("100.3"),
+            )
+            raw_api = FakeFuturesApi()
+            listener = futures_grid.FuturesOrderListener(
+                core.threading.Event(), store,
+                futures_grid.FuturesGridApi(raw_api, "usdt"),
+                "SOXL_USDT", "code", contract_spec().grid_spec,
+                Decimal("0.003"), "fb", "ft", "wss://example.test/ws",
+                core.PriceState(Decimal("50")), Decimal("100"),
+                Decimal("0.01"), 20, 10, user_id="123",
+            )
+            listener._receive_event({
+                "id": "buy-1",
+                "contract": "SOXL_USDT",
+                "size": "2",
+                "left": "0",
+                "price": "100",
+                "status": "finished",
+                "finish_as": "filled",
+                "text": "t-fbcode-buy",
+            })
+            row = store.active("SOXL_USDT", "code")[0]
+            assert row["buy_status"] == core.BUY_FILLED
+            assert row["tp_status"] == core.TP_WAIT_PLACE
+            assert row["tp_order_id"] is None
+            assert raw_api.created == []
+        finally:
+            store.close()
+
+
+def test_futures_grid_uses_shared_atomic_activity_limit():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = core.GridStore(Path(temp_dir) / "futures-grid.sqlite3")
+        try:
+            raw_api = FakeFuturesApi()
+            api = futures_grid.FuturesGridApi(raw_api, "usdt")
+            planned = [core.PlannedOrder(Decimal("100"), Decimal("2"))]
+            for _ in range(2):
+                assert core.place_missing_buys(
+                    api, store, "SOXL_USDT", "code", planned,
+                    Decimal("0.003"), contract_spec().grid_spec,
+                    False, "fb", max_unclosed_per_grid=1,
+                )
+            assert len(raw_api.created) == 1
+            assert store.activity_count(
+                "SOXL_USDT", "code", Decimal("100")
+            ) == 1
+        finally:
+            store.close()

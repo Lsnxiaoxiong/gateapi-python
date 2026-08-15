@@ -2,3 +2,12 @@ scp -P 23334 D:\source\python-okx\demo\auto_grid_btc_usdt_swap.py root@192.168.3
 scp -P 23334 D:\source\gateapi-python\example\* root@192.168.30.102:/usr/app/example/
 scp -r -P 23334 D:\source\gateapi-python\* root@192.168.30.102:/usr/app/
 scp -P 23334 D:\source\gateapi-python\example\.env root@192.168.30.102:/usr/app/example/.env
+scp -P 23334 D:\source\gateapi-python\example\auto_grid_contract_futures_generic.py root@192.168.30.102:/usr/app/example/auto_grid_contract_futures_generic.py
+scp -P 23334 D:\source\gateapi-python\example\auto_grid_futures_generic.py root@192.168.30.102:/usr/app/example/auto_grid_futures_generic.py
+
+
+
+
+sudo nano /etc/systemd/system/gate-grid-skhynix.service
+
+

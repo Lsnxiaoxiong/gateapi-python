@@ -257,28 +257,60 @@ def configure_futures_account(
     )
     position_mode = str(getattr(account, "position_mode", "") or "")
     in_dual_mode = bool(getattr(account, "in_dual_mode", False))
-    if in_dual_mode or position_mode in {"dual", "dual_plus"}:
-        raise RuntimeError(
-            "当前合约账户不是单向持仓模式；本多头网格拒绝在双向持仓模式运行"
-        )
+    dual_mode = in_dual_mode or position_mode in {"dual", "dual_plus"}
     core.call_with_retry(
         "设置合约杠杆",
-        lambda: api.update_position_leverage(
-            settle, contract, core.decimal_text(leverage),
-            _request_timeout=core.NETWORK_TIMEOUT,
+        lambda: (
+            api.update_dual_mode_position_leverage(
+                settle, contract, core.decimal_text(leverage),
+                _request_timeout=core.NETWORK_TIMEOUT,
+            )
+            if dual_mode else api.update_position_leverage(
+                settle, contract, core.decimal_text(leverage),
+                _request_timeout=core.NETWORK_TIMEOUT,
+            )
         ),
     )
-    return position_mode or "single"
+    return "dual" if dual_mode else (position_mode or "single")
 
 
 class FuturesOrderListener(core.OrderListener):
-    """订阅 ``futures.orders``，将推送字段归一化后交给原状态机。"""
+    """订阅合约订单，并复用核心的20格范围、最近10单止盈维护逻辑。"""
 
     channel_name = "futures.orders"
     account_name = "futures"
 
-    def __init__(self, *args, user_id: str, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        stop,
+        store,
+        api,
+        pair,
+        code,
+        spec,
+        take_profit_pct,
+        buy_prefix,
+        sell_prefix,
+        ws_url,
+        price_state=None,
+        reference=None,
+        step_pct=None,
+        take_profit_grid_count=None,
+        take_profit_count=None,
+        *,
+        user_id: str,
+    ):
+        # 父类仅传入旧版也支持的基础参数，避免合约文件与核心文件部署不同步时
+        # 因新增窗口参数产生 ``takes 11 positional arguments``。
+        super().__init__(
+            stop, store, api, pair, code, spec, take_profit_pct,
+            buy_prefix, sell_prefix, ws_url,
+        )
+        self.price_state = price_state
+        self.reference = reference
+        self.step_pct = step_pct
+        self.take_profit_grid_count = take_profit_grid_count
+        self.take_profit_count = take_profit_count
         self.user_id = user_id
 
     @staticmethod
@@ -351,7 +383,7 @@ def run_grid(
     sell_client_order_prefix: str = "ft",
     buy_grid_count: int = 10,
     take_profit_count: int = 10,
-    take_profit_grid_count: int = 10,
+    take_profit_grid_count: int = 20,
     max_unclosed_per_grid: int = 2,
     grid_step_pct="0.003",
     take_profit_pct="0.003",
@@ -453,11 +485,15 @@ def run_grid(
     order_listener = FuturesOrderListener(
         stop, store, apis[2], contract, code, contract_spec.grid_spec, tp_pct,
         buy_client_order_prefix, sell_client_order_prefix, ws_url,
+        price_state, reference, step_pct, take_profit_grid_count,
+        take_profit_count,
         user_id=user_id,
     )
     state_reconciler = FuturesOrderListener(
         stop, store, apis[3], contract, code, contract_spec.grid_spec, tp_pct,
         buy_client_order_prefix, sell_client_order_prefix, ws_url,
+        price_state, reference, step_pct, take_profit_grid_count,
+        take_profit_count,
         user_id=user_id,
     )
     order_state_checker = core.OrderStateChecker(stop, state_reconciler)
@@ -577,7 +613,7 @@ def run_SOXL() -> None:
         settle="usdt",
         buy_grid_count=10,
         take_profit_count=10,
-        take_profit_grid_count=10,
+        take_profit_grid_count=20,  # 检查现价上方20个网格，最多保留10个止盈单
         max_unclosed_per_grid=2,  # 单个网格价位最多保留的已成交未止盈周期数
         grid_step_pct="0.003",
         take_profit_pct="0.003",
