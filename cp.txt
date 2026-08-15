@@ -8,6 +8,17 @@ scp -P 23334 D:\source\gateapi-python\example\auto_grid_futures_generic.py root@
 
 
 
+
+
+
 sudo nano /etc/systemd/system/gate-grid-skhynix.service
 
+sudo systemctl daemon-reload
+sudo systemctl enable gate-grid-skhynix
+sudo systemctl start gate-grid-skhynix
 
+sudo systemctl stop gate-grid-skhynix
+sudo systemctl restart gate-grid-skhynix
+sudo systemctl status gate-grid-skhynix
+
+sudo journalctl -u gate-grid-skhynix -f
