@@ -17,11 +17,11 @@ from gate_api import ApiClient, Configuration, FuturesApi, FuturesOrder
 from gate_api.exceptions import GateApiException
 
 
-CONTRACT = "SKHYNIX_USDT"
+CONTRACT = "HEMI_USDT"
 SETTLE = "usdt"
-MARGIN_AMOUNT = "1.5"  # 预计占用的保证金，单位 USDT
-LEVERAGE = "2"       # 杠杆倍数
-PRICE = "10"        # 限价，单位 USDT
+MARGIN_AMOUNT = "0.8"  # 预计占用的保证金，单位 USDT
+LEVERAGE = "1"       # 杠杆倍数
+PRICE = "0.005"        # 限价，单位 USDT
 LIVE_CONFIRM_TEXT = "PLACE_FUTURES_ORDER"
 
 

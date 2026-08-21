@@ -703,19 +703,46 @@ class GridStore:
             return cursor.rowcount
 
     def set_take_profit_open(self, row_id: int, order) -> None:
+        order_id = str(order.id)
+        order_text = str(order.text or "")
         with self.lock:
             cursor = self.db.execute(
                 "UPDATE grid_cycles SET tp_order_id=?,tp_order_text=?,tp_status=?,"
                 "position_status=?,updated_at=? WHERE id=? AND completed=0 "
                 "AND tp_status=?",
                 (
-                    str(order.id), str(order.text or ""), TP_OPEN,
+                    order_id, order_text, TP_OPEN,
                     POSITION_WAIT_TP, time.time(), row_id, TP_SUBMITTING,
                 ),
             )
             self.db.commit()
-            if cursor.rowcount != 1:
-                raise RuntimeError(f"止盈挂单写库抢占已失效：记录={row_id}")
+            if cursor.rowcount == 1:
+                return
+
+            # WebSocket/REST 监听线程可能在下单接口返回后、当前线程写库前，
+            # 已经把同一个 Gate 订单恢复关联到此记录。相同订单视为幂等成功，
+            # 避免误判抢占失效后撤销订单并在下一轮重复创建。
+            current = self.db.execute(
+                "SELECT completed,tp_status,tp_order_id FROM grid_cycles WHERE id=?",
+                (row_id,),
+            ).fetchone()
+            if (
+                current is not None
+                and not current["completed"]
+                and current["tp_status"] == TP_OPEN
+                and str(current["tp_order_id"] or "") == order_id
+            ):
+                return
+
+            current_status = current["tp_status"] if current is not None else "不存在"
+            current_order_id = (
+                str(current["tp_order_id"] or "") if current is not None else ""
+            )
+            raise RuntimeError(
+                f"止盈挂单写库抢占已失效：记录={row_id}，"
+                f"当前状态={current_status}，当前订单={current_order_id}，"
+                f"待写订单={order_id}"
+            )
 
     def attach_missing_take_profit(
         self,

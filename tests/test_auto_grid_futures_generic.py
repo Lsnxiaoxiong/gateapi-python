@@ -899,6 +899,51 @@ class DatabaseGridTest(unittest.TestCase):
         self.assertTrue(self.store.claim_take_profit(row_id))
         self.assertFalse(self.store.claim_take_profit(row_id))
 
+    def test_take_profit_write_is_idempotent_when_listener_attached_same_order(self):
+        row_id = self.insert(price="100", size="0.03")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,remaining_size=?,position_status=?,"
+            "tp_status=? WHERE id=?",
+            (
+                grid.BUY_FILLED, "0.03", grid.POSITION_WAIT_TP_ORDER,
+                grid.TP_WAIT_PLACE, row_id,
+            ),
+        )
+        self.assertTrue(self.store.claim_take_profit(row_id))
+        attached = self.store.attach_missing_take_profit(
+            "ETH_USDT", "code", "tp-same", "t-dtcode-same",
+            Decimal("100.3"), Decimal("0.03"),
+        )
+        self.assertIsNotNone(attached)
+
+        self.store.set_take_profit_open(
+            row_id, SimpleNamespace(id="tp-same", text="t-dtcode-same")
+        )
+        row = self.store.one(row_id)
+        self.assertEqual("tp-same", row["tp_order_id"])
+        self.assertEqual(grid.TP_OPEN, row["tp_status"])
+
+    def test_take_profit_write_still_rejects_a_different_attached_order(self):
+        row_id = self.insert(price="100", size="0.03")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,remaining_size=?,position_status=?,"
+            "tp_status=? WHERE id=?",
+            (
+                grid.BUY_FILLED, "0.03", grid.POSITION_WAIT_TP_ORDER,
+                grid.TP_WAIT_PLACE, row_id,
+            ),
+        )
+        self.assertTrue(self.store.claim_take_profit(row_id))
+        self.store.attach_missing_take_profit(
+            "ETH_USDT", "code", "tp-listener", "t-dtcode-listener",
+            Decimal("100.3"), Decimal("0.03"),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "当前订单=tp-listener"):
+            self.store.set_take_profit_open(
+                row_id, SimpleNamespace(id="tp-creator", text="t-dtcode-creator")
+            )
+
     def test_stale_take_profit_claim_can_be_recovered_after_reconciliation(self):
         row_id = self.insert(price="100", size="0.03")
         self.store.execute(

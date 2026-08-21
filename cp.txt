@@ -12,13 +12,29 @@ scp -P 23334 D:\source\gateapi-python\example\auto_grid_futures_generic.py root@
 
 
 sudo nano /etc/systemd/system/gate-grid-skhynix.service
+sudo nano /etc/systemd/system/gate-grid-aio.service
+sudo nano /etc/systemd/system/gate-grid-soxl.service
 
 sudo systemctl daemon-reload
-sudo systemctl enable gate-grid-skhynix
-sudo systemctl start gate-grid-skhynix
+sudo systemctl enable gate-grid-bot
+sudo systemctl start gate-grid-bot
+sudo systemctl start gate-grid-hemi
+sudo systemctl disable gate-grid-hemi
 
+sudo systemctl stop gate-grid-bot
 sudo systemctl stop gate-grid-skhynix
 sudo systemctl restart gate-grid-skhynix
+sudo systemctl restart gate-grid-hemi
+sudo systemctl restart gate-grid-aio
 sudo systemctl status gate-grid-skhynix
+sudo systemctl status gate-grid-hemi
+sudo systemctl status gate-grid-bot
+
+
 
 sudo journalctl -u gate-grid-skhynix -f
+sudo journalctl -u gate-grid-bot -f
+sudo journalctl -u gate-grid-hemi -f
+sudo journalctl -u gate-grid-aio -f
+sudo journalctl -u gate-grid-gps -f
+sudo journalctl -u gate-grid-eth -f

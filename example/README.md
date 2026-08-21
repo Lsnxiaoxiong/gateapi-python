@@ -35,6 +35,35 @@ GATE_LIVE_CONFIRM=RUN_REAL_FUTURES_DB_GRID
 合约网格使用独立数据库 `example/futures_grid_orders.sqlite3`，不会读取现货
 杠杆网格的 `grid_orders.sqlite3`。
 
+## USDT 永续合约 做空 数据库网格
+
+`auto_grid_contract_futures_short_generic.py` 是**做空方向**的永续合约网格入口，
+与上面的多头版本互为镜像：
+
+- 网格价位从参考价**向上**排列（`reference*(1+step)^index`），在现价上方
+  挂 **SELL** 开空单（负张数、`reduce_only=False`）开空；
+- 开空成交后，在开空价**下方**挂 **BUY** 平仓单（正张数、`reduce_only=True`）
+  平掉空仓，低买平空获利；
+- 平仓窗口为现价**下方**区间 `[lower, current)`，只维护落在窗口内的平仓单；
+- 使用独立数据库 `example/futures_short_grid_orders.sqlite3` 与独立策略码
+  （默认 `grid_tag=futshort01`），不会与多头网格或现货网格冲突。
+
+安全预览（默认合约为 `SOXL_USDT`）：
+
+```bash
+python example/auto_grid_contract_futures_short_generic.py
+```
+
+实盘确认值（设置于 `.env`）：
+
+```ini
+GATE_LIVE_CONFIRM=RUN_REAL_FUTURES_SHORT_DB_GRID
+```
+
+做空网格与多头网格一样只支持单向持仓模式；开空单和平仓单使用不同的订单
+前缀（默认开空 `ss`、平仓 `sb`），便于 WebSocket 与 REST 对账区分。
+
+
 ## Build
 
 1. Clone this project and make sure it is named with `gateapi-python`
