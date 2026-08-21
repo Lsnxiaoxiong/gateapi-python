@@ -1,0 +1,101 @@
+rank,symbol,symbol_desc,cmp_amp_avg10min_pct,amp_avg_pct,amp_max_pct,amp_24h_range_pct,amp_n_candles,spot_available,spot_exchange,trade_mode,status
+1,BSP,Bending Spoons S.p.A.,1.2379,1.7938,6.6311,33.2817,95,False,,4,closed
+2,SNXX,Tradr 2X Long SNDK Daily ETF,0.9939,2.4617,12.812,68.8689,95,False,,4,closed
+3,ZHIPU,ZhiPu 02513.HK,0.9377,1.9273,7.4507,21.3993,95,False,,4,closed
+4,KBLAM,建滔积层板01888.HK,0.9107,1.5639,4.7112,20.2381,95,False,,4,closed
+5,MINIMAX,MINIMAX-W 00100.HK,0.9022,2.0248,6.9616,27.5474,95,False,,4,closed
+6,FCEL,FuelCell Energy Inc,0.8718,1.6575,8.9911,22.7296,95,True,us,4,closed
+7,SHAZ,SharonAI Holdings Inc.,0.8328,1.5294,13.8598,42.0556,95,True,us,4,closed
+8,CBRS,Cerebras Systems Inc.,0.8069,1.4299,7.3604,21.4913,95,True,us,4,closed
+9,INTW,Direxion Daily Semiconductor Bear 3X Shares,0.7528,1.5514,9.8258,22.5893,95,True,us,4,closed
+10,AXTI,"AXT, Inc.",0.7443,1.629,10.7075,17.4001,95,True,us,4,closed
+11,IREN,Iris Energy,0.7383,1.3722,11.1811,24.7168,95,True,us,4,closed
+12,KORU,Direxion Daily MSCI South Korea Bull 3X Shares,0.7035,1.3713,14.5703,32.2689,95,True,us,4,closed
+13,MVLL,GraniteShares 2x Long MRVL Daily ETF,0.6871,1.5924,12.0173,22.1865,95,True,us,4,closed
+14,BOT,"Direxion Daily Robotics, AI & Automation Bull 2X Shares",0.6848,1.6156,6.5057,18.0797,95,False,,4,closed
+15,CRWV,"CoreWeave, Inc.",0.6774,1.4658,23.4382,33.663,95,True,us,4,closed
+16,SOXS,Direxion Daily Semiconductor Bear 3X ETF,0.6656,1.1989,3.4216,17.228,95,True,us,4,closed
+17,KBHLD,建滔集团00148.HK,0.6557,1.083,3.9684,12.2843,95,False,,4,closed
+18,JUSUNG,"Jusung Engineering Co., Ltd.",0.6538,1.3496,5.4401,20.8628,95,False,,4,closed
+19,XUNCE,XUNCE 03317.HK,0.6519,1.3816,6.2613,9.2157,95,False,,4,closed
+20,IOVA,Iovance Biotherapeutics Inc,0.613,0.9641,3.5821,10.2201,95,True,us,4,closed
+21,NBIS,Nubis,0.6034,1.5834,17.4043,46.8392,95,True,us,4,closed
+22,MUU,Direxion Daily MU Bull 2X Shares,0.602,1.4623,11.4109,32.9398,95,True,us,4,closed
+23,HUT,Hut 8 Mining Corp,0.5867,1.2059,7.294,16.5248,95,True,us,4,closed
+24,CLSK,CleanSpark Inc,0.5853,1.0884,5.309,11.5219,95,True,us,4,closed
+25,SOXL,Direxion Daily Semiconductor Bull 3X ETF,0.5739,1.1935,9.9504,18.0309,95,True,us,4,closed
+26,SKSQUARE,"SK Square Co., Ltd.",0.572,1.2889,9.9415,27.8195,95,False,,4,closed
+27,IONQ,"IonQ, Inc.",0.5676,0.9813,4.0035,13.1285,95,True,us,4,closed
+28,CRCL,Circle,0.5445,0.8845,3.1909,9.8449,95,True,us,4,closed
+29,ONDS,Ondas 控股,0.5041,1.1432,7.7528,12.1115,95,True,us,4,closed
+30,RKLB,Rocket Lab Corp,0.4997,1.042,6.1683,8.5347,95,True,us,4,closed
+31,GRPN,Groupon Inc,0.4906,0.8686,4.6382,6.5836,95,False,,4,closed
+32,WDC,Western Digital Corp,0.4845,0.9773,4.9447,17.9858,95,True,us,4,closed
+33,GLXY,Galaxy Digital Inc.,0.4773,1.0037,7.1109,11.9645,95,True,us,4,closed
+34,TSLL,Direxion Daily TSLA Bull 2X Shares,0.4761,0.9154,4.2824,16.3462,95,True,us,4,closed
+35,SMCI,"Super Micro Computer, Inc.",0.4713,1.3942,17.0786,35.8365,95,True,us,4,closed
+36,HPSP,"HPSP Co., Ltd.",0.4687,0.8711,3.8929,13.8667,95,False,,4,closed
+37,OKLO,OKLO Inc,0.4662,0.8517,2.932,7.2939,95,True,us,4,closed
+38,ASTS,AST SpaceMobile Inc,0.466,1.0162,5.0272,8.9625,95,True,us,4,closed
+39,FIG,Figma Inc,0.4622,0.9051,4.3551,13.6364,95,True,us,4,closed
+40,ALAB,"Astera Labs, Inc.",0.4604,0.9451,5.9327,9.6972,95,True,us,4,closed
+41,LENOVO,LENOVO 00992.HK,0.4473,1.3806,14.6862,29.6017,95,False,,4,closed
+42,SKHYNIX,SK Hynix Inc.,0.4472,0.9787,5.1144,20.8184,95,False,,4,closed
+43,STX,Seagate,0.4452,0.9426,6.1276,21.7823,95,True,us,4,closed
+44,BE,Bloom Energy Corp,0.4401,1.1788,13.4874,17.4709,95,True,us,4,closed
+45,TSEM,Tower Semiconductor Ltd.,0.4385,0.9378,7.6228,9.2606,95,True,us,4,closed
+46,PLAY,Dave & Buster's Entertainmen,0.4317,0.8039,5.3191,12.7033,95,False,,4,closed
+47,BMNR,BitMine Immersion Technologies Inc,0.4304,0.7663,2.2854,5.9185,95,True,us,4,closed
+48,SKHY,SK Hynix Inc.,0.4253,0.856,5.7121,23.6392,95,True,us,4,closed
+49,LITE,Lumentum Holdings Inc.,0.4252,1.2599,10.6651,19.6713,95,True,us,4,closed
+50,CRDO,Credo Technology Group Holding Ltd,0.4176,1.0029,8.1868,18.1893,95,True,us,4,closed
+51,AKESO,AKESO 09926.HK,0.4114,0.8005,2.9345,10.2375,95,False,,4,closed
+52,AALG,AMERICAN AIRLINES GROUP INC,0.4097,0.8841,3.6787,9.8025,95,False,,4,closed
+53,TER,"Teradyne, Inc.",0.4024,0.7581,5.7839,12.8049,95,True,us,4,closed
+54,SENS,Senseonich Holdings Inc.,0.3996,0.9228,8.1737,12.0712,95,False,,4,closed
+55,DELL,Dell Technologies Inc,0.3974,0.7865,5.8729,17.5664,95,True,us,4,closed
+56,SAMSUNG,Samsung Electronics,0.3923,0.804,7.9245,16.3866,95,False,,4,closed
+57,SAMSUNGEM,"Samsung Electro-Mechanics Co., Ltd.",0.3916,0.8197,8.1071,16.5931,95,False,,4,closed
+58,MSTR,Microstrategy Inc - Class A,0.3873,0.7523,3.2465,7.4979,95,True,us,4,closed
+59,BLSH,Bullish Inc.,0.3806,1.1225,12.3728,17.3608,95,True,us,4,closed
+60,OPFI,OppFi Inc,0.3788,0.9441,8.3578,13.3333,95,False,,4,closed
+61,NVDL,GraniteShares 2x Long NVDA Daily ETF,0.3761,0.7425,4.1387,10.092,95,True,us,4,closed
+62,DAVE,Dave Inc,0.3676,0.7397,2.9269,14.6692,95,True,us,4,closed
+63,Z,Zillow Group Inc,0.3647,0.6911,3.8997,10.2527,95,True,us,4,closed
+64,TTD,The Trade Desk Inc - Class A,0.359,0.7386,2.8209,11.9414,95,True,us,4,closed
+65,FLNC,"Fluence Energy, Inc.",0.3559,0.8459,4.9355,5.2551,95,True,us,4,closed
+66,AMKR,"Amkor Technology, Inc.",0.3541,0.7426,4.5421,12.9315,95,True,us,4,closed
+67,SBET,SharpLink Gaming Inc,0.3539,0.6819,3.0016,5.5829,95,False,,4,closed
+68,SWKS,Skyworks Solutions Inc.,0.3525,0.5643,1.6176,4.4428,95,True,us,4,closed
+69,PENG,"Penguin Solutions, Inc.",0.3517,0.9184,4.9353,12.6928,95,True,us,4,closed
+70,CLS,Celestica Inc,0.3492,0.7995,4.4501,17.9187,95,True,us,4,closed
+71,MRVL,Marvell Technology Group Ltd,0.338,0.8,5.774,10.9393,95,True,us,4,closed
+72,FN,Fabrinet ,0.3368,0.8197,8.7645,13.1022,95,True,us,4,closed
+73,OKTA,Okta Inc,0.3363,0.6079,2.738,6.1302,95,True,us,4,closed
+74,DKNG,DraftKings（美国体育博彩龙头）,0.3355,0.5649,3.1546,6.2747,95,True,us,4,closed
+75,AMZU,Direxion Daily AMZN Bull 2X Shares,0.3342,0.5725,2.1849,8.0295,95,True,us,4,closed
+76,SE,SEA LTD-ADR,0.3266,0.6038,2.2337,8.295,95,True,us,4,closed
+77,GPRO,GoPro Inc,0.3252,1.2982,7.1429,14.5161,95,False,,4,closed
+78,MPWR,Monolithic Power Systems Inc,0.3236,0.5573,3.4394,6.8683,95,True,us,4,closed
+79,PSIX,Power Solutions International Inc,0.3217,0.7194,3.6545,7.8408,95,False,,4,closed
+80,MDB,"MongoDB, Inc.",0.3195,0.6967,4.2341,9.8538,95,True,us,4,closed
+81,NXT,Nextpower Inc.,0.309,0.6345,2.7298,6.2872,95,True,us,4,closed
+82,NTAP,Netapp Inc,0.3055,0.4978,3.0281,6.2672,95,True,us,4,closed
+83,TRMB,TRIMBLE INC,0.3043,0.79,9.0956,11.6805,95,True,us,4,closed
+84,MPC,Marathon Petroleum Corp,0.3042,0.4671,1.5325,8.8769,95,True,us,4,closed
+85,GLW,Corning Incorporated ,0.302,0.7222,6.4232,7.327,95,True,us,4,closed
+86,CHTR,Charter Communications Inc.,0.3003,0.5018,1.7671,5.89,95,True,us,4,closed
+87,AMD,Advanced Micro Devices / AMD,0.2972,0.5773,2.7406,10.5869,95,True,us,4,closed
+88,METU,Direxion Daily META Bull 2X Shares,0.2962,0.7006,3.4804,10.0707,95,True,us,4,closed
+89,STRL,Sterling Infrastructure Inc,0.2946,0.6948,4.3797,8.7159,95,True,us,4,closed
+90,HPE,Hewlett Packard Enterprise Co / HPE,0.2944,0.6987,7.5745,17.1664,95,True,us,4,closed
+91,MANU,Manchester United PLC,0.2929,0.7081,4.7445,11.8753,95,False,,4,closed
+92,CGNX,Cognex Corporation,0.2929,0.5482,3.8299,8.4212,95,True,us,4,closed
+93,MCHP,Microchip Technology Incorporated,0.2919,0.5025,2.2145,6.837,95,True,us,4,closed
+94,VRT,Vertiv Holdings Co,0.2917,0.6021,4.9457,7.3523,95,True,us,4,closed
+95,AMAT,Applied Materials,0.2901,0.7691,7.9525,12.3372,95,True,us,4,closed
+96,HOG,Harley-Davidson Inc.,0.2892,0.5416,2.3649,9.0087,95,True,us,4,closed
+97,PANW,Palo Alto Networks,0.2885,0.5716,2.3005,5.895,95,True,us,4,closed
+98,FLEX,Flex Ltd.,0.2876,0.654,5.1827,7.4775,95,True,us,4,closed
+99,DRAM,Roundhill Memory ETF,0.2861,0.6798,7.3645,16.3954,95,True,us,4,closed
+100,GNRC,Generac Holdings Inc,0.2859,0.6289,3.3043,5.7938,95,True,us,4,closed
