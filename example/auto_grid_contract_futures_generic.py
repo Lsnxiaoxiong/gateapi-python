@@ -138,6 +138,27 @@ class FuturesGridApi:
             self.api.cancel_futures_order(self.settle, order_id, **kwargs)
         )
 
+    def get_directional_position_size(self, pair: str, direction: str) -> Decimal:
+        """读取指定方向的实际合约张数；单向/双向持仓模式均可使用。"""
+        def read() -> Decimal:
+            if getattr(self, "position_mode", "single") == "dual":
+                positions = self.api.get_dual_mode_position(
+                    self.settle, pair, _request_timeout=core.NETWORK_TIMEOUT
+                )
+                sizes = [Decimal(str(getattr(item, "size", "0") or "0")) for item in positions]
+                return (
+                    sum((max(Decimal("0"), size) for size in sizes), Decimal("0"))
+                    if direction == "long" else
+                    sum((max(Decimal("0"), -size) for size in sizes), Decimal("0"))
+                )
+            position = self.api.get_position(
+                self.settle, pair, _request_timeout=core.NETWORK_TIMEOUT
+            )
+            size = Decimal(str(getattr(position, "size", "0") or "0"))
+            return max(Decimal("0"), size) if direction == "long" else max(Decimal("0"), -size)
+
+        return core.call_with_retry("读取合约实际持仓", read)
+
 
 def make_configuration(host: str, key=None, secret=None) -> Configuration:
     configuration = Configuration(host=host, key=key, secret=secret)
@@ -274,6 +295,54 @@ def configure_futures_account(
     return "dual" if dual_mode else (position_mode or "single")
 
 
+TP_EXTERNALLY_CLOSED = "仓位已外部平仓"
+POSITION_EXTERNALLY_CLOSED = "仓位已外部平仓"
+
+
+def reconcile_futures_position(
+    api: FuturesGridApi,
+    store: core.GridStore,
+    pair: str,
+    code: str,
+    direction: str,
+) -> Decimal:
+    """以 Gate 实际仓位为准清理失联周期，并返回可用于新平仓单的数量。"""
+    actual_size = api.get_directional_position_size(pair, direction)
+    rows = [
+        row for row in store.active(pair, code)
+        if row["buy_status"] == core.BUY_FILLED and not row["completed"]
+    ]
+    expected_size = sum((Decimal(row["remaining_size"]) for row in rows), Decimal("0"))
+    if actual_size <= 0:
+        if not rows:
+            return Decimal("0")
+        for row in rows:
+            if row["tp_order_id"] and row["tp_status"] == core.TP_OPEN:
+                core.cancel_api_order(api, pair, row["tp_order_id"], ignore_absent=True)
+        store.execute(
+            "UPDATE grid_cycles SET remaining_size='0',tp_order_id=NULL,"
+            "tp_order_text=NULL,tp_status=?,position_status=?,completed=1,"
+            "updated_at=? WHERE currency_pair=? AND strategy_code=? "
+            "AND completed=0 AND buy_status=?",
+            (
+                TP_EXTERNALLY_CLOSED, POSITION_EXTERNALLY_CLOSED, time.time(),
+                pair, code, core.BUY_FILLED,
+            ),
+        )
+        print(
+            f"[{core.now_text()}] 合约实际{('多' if direction == 'long' else '空')}仓为0，"
+            f"已关闭 {len(rows)} 条数据库残留周期"
+        )
+        return Decimal("0")
+    if expected_size > actual_size:
+        print(
+            f"[{core.now_text()}] 合约实际{('多' if direction == 'long' else '空')}仓="
+            f"{actual_size}，数据库待平数量={expected_size}；"
+            "仅按实际仓位剩余数量补平仓单"
+        )
+    return actual_size
+
+
 class FuturesOrderListener(core.OrderListener):
     """订阅合约订单，并复用核心的20格范围、最近10单止盈维护逻辑。"""
 
@@ -312,6 +381,30 @@ class FuturesOrderListener(core.OrderListener):
         self.take_profit_grid_count = take_profit_grid_count
         self.take_profit_count = take_profit_count
         self.user_id = user_id
+
+    def _maintain_take_profits_after_buy_fill(self) -> None:
+        if (
+            self.price_state is None
+            or self.reference is None
+            or self.step_pct is None
+            or self.take_profit_grid_count is None
+            or self.take_profit_count is None
+        ):
+            return
+        current = self.price_state.get()
+        available_size = reconcile_futures_position(
+            self.api, self.store, self.pair, self.code, "long"
+        )
+        if available_size <= 0:
+            return
+        upper = core.take_profit_window_upper(
+            self.reference, current, self.step_pct,
+            self.take_profit_grid_count, self.spec,
+        )
+        core.reconcile_take_profits(
+            self.api, self.store, self.pair, self.code, current, upper,
+            self.spec, self.sell_prefix, self.take_profit_count, available_size,
+        )
 
     @staticmethod
     def _normalise_event(event: dict) -> dict:
@@ -481,6 +574,9 @@ def run_grid(
         buy_grid_count, take_profit_grid_count, take_profit_count,
         contract_spec.grid_spec, sell_client_order_prefix,
         max_unclosed_per_grid,
+        take_profit_available_size=lambda: reconcile_futures_position(
+            apis[1], store, contract, code, "long"
+        ),
     )
     order_listener = FuturesOrderListener(
         stop, store, apis[2], contract, code, contract_spec.grid_spec, tp_pct,
@@ -513,6 +609,8 @@ def run_grid(
         mode = configure_futures_account(
             futures_apis[0], settle, contract, leverage_value
         )
+        for api in apis:
+            api.position_mode = mode
         if startup_mode == "reset":
             core.reset_pair(apis[0], store, contract)
         else:
@@ -553,7 +651,7 @@ def run_grid(
                 pending = sum(row["buy_status"] == core.WAIT_BUY for row in rows)
                 open_tps = sum(row["tp_status"] == core.WAIT_TP for row in rows)
                 waiting = sum(
-                    row["tp_status"] in {
+                    row["buy_status"] == core.BUY_FILLED and row["tp_status"] in {
                         core.TP_NOT_SET, core.TP_WAIT_PLACE,
                         core.TP_SUBMITTING, core.TP_CANCELLED,
                     }

@@ -294,6 +294,8 @@ class ShortFuturesGridApi:
             self.api.cancel_futures_order(self.settle, order_id, **kwargs)
         )
 
+    get_directional_position_size = ref.FuturesGridApi.get_directional_position_size
+
 
 def create_futures_limit_order(
     api: ShortFuturesGridApi,
@@ -476,6 +478,7 @@ def reconcile_short_take_profits(
     spec: core.PairSpec,
     prefix: str,
     limit: int,
+    available_size: Optional[Decimal] = None,
 ) -> None:
     """维护现价下方的平仓单窗口：撤销窗口外的平仓单，为已开空仓位补平仓单。"""
     for row in store.active(pair, code):
@@ -543,10 +546,28 @@ def reconcile_short_take_profits(
         "ORDER BY CAST(tp_price AS REAL) DESC",
         tuple(selected_ids),
     )
+    remaining_capacity = available_size
+    if remaining_capacity is not None:
+        remaining_capacity = max(Decimal("0"), remaining_capacity)
+        for row in rows:
+            if row["tp_status"] == core.TP_OPEN and not row["completed"]:
+                remaining_capacity = max(
+                    Decimal("0"),
+                    remaining_capacity - Decimal(row["remaining_size"]),
+                )
     for row in rows:
         if row["tp_status"] in {core.TP_OPEN, core.TP_SUBMITTING} or row["completed"]:
             continue
-        submit_short_take_profit(api, store, row, pair, code, spec, prefix)
+        size = Decimal(row["remaining_size"])
+        if remaining_capacity is not None and size > remaining_capacity:
+            print(
+                f"[{core.now_text()}] 实际空仓可用数量={remaining_capacity}，"
+                f"暂不新增平仓单：记录={row['id']}，需要={size}"
+            )
+            continue
+        if submit_short_take_profit(api, store, row, pair, code, spec, prefix):
+            if remaining_capacity is not None:
+                remaining_capacity -= size
 
 
 def cancel_orphan_short_covers(
@@ -645,13 +666,18 @@ class ShortOrderListener:
         ):
             return
         current = self.price_state.get()
+        available_size = ref.reconcile_futures_position(
+            self.api, self.store, self.pair, self.code, "short"
+        )
+        if available_size <= 0:
+            return
         lower = short_take_profit_window_lower(
             self.reference, current, self.step_pct,
             self.take_profit_grid_count, self.spec,
         )
         reconcile_short_take_profits(
             self.api, self.store, self.pair, self.code, current, lower,
-            self.spec, self.cover_prefix, self.take_profit_count,
+            self.spec, self.cover_prefix, self.take_profit_count, available_size,
         )
 
     def _strategy_text(self, side: str) -> str:
@@ -1016,6 +1042,7 @@ class ShortGridChecker:
         spec: core.PairSpec,
         cover_prefix: str,
         max_unclosed_per_grid: int = 2,
+        take_profit_available_size=None,
     ):
         self.stop = stop
         self.store = store
@@ -1031,6 +1058,7 @@ class ShortGridChecker:
         self.spec = spec
         self.cover_prefix = cover_prefix
         self.max_unclosed_per_grid = max_unclosed_per_grid
+        self.take_profit_available_size = take_profit_available_size
 
     def run(self) -> None:
         while not self.stop.is_set():
@@ -1051,9 +1079,14 @@ class ShortGridChecker:
                     self.reference, current, self.step_pct,
                     self.take_profit_grid_count, self.spec,
                 )
+                available_size = (
+                    self.take_profit_available_size()
+                    if self.take_profit_available_size is not None else None
+                )
                 reconcile_short_take_profits(
                     self.api, self.store, self.pair, self.code, current, lower,
                     self.spec, self.cover_prefix, self.take_profit_count,
+                    available_size,
                 )
             except Exception as exc:
                 detail = (
@@ -1188,6 +1221,9 @@ def run_short_grid(
         short_grid_count, take_profit_grid_count, take_profit_count,
         contract_spec.grid_spec, cover_client_order_prefix,
         max_unclosed_per_grid,
+        take_profit_available_size=lambda: ref.reconcile_futures_position(
+            apis[1], store, contract, code, "short"
+        ),
     )
     order_listener = ShortOrderListener(
         stop, store, apis[2], contract, code, contract_spec.grid_spec, tp_pct,
@@ -1220,6 +1256,8 @@ def run_short_grid(
         mode = configure_futures_account(
             futures_apis[0], settle, contract, leverage_value
         )
+        for api in apis:
+            api.position_mode = mode
         if startup_mode == "reset":
             core.reset_pair(apis[0], store, contract)
         state_sync.start()
@@ -1253,7 +1291,7 @@ def run_short_grid(
                 pending = sum(row["buy_status"] == core.WAIT_BUY for row in rows)
                 open_covers = sum(row["tp_status"] == core.WAIT_TP for row in rows)
                 waiting = sum(
-                    row["tp_status"] in {
+                    row["buy_status"] == core.BUY_FILLED and row["tp_status"] in {
                         core.TP_NOT_SET, core.TP_WAIT_PLACE,
                         core.TP_SUBMITTING, core.TP_CANCELLED,
                     }

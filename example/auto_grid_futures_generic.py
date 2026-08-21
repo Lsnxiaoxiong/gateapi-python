@@ -1520,6 +1520,7 @@ class GridChecker:
         spec: PairSpec,
         sell_prefix: str,
         max_unclosed_per_grid: int = 2,
+        take_profit_available_size: Optional[Callable[[], Optional[Decimal]]] = None,
     ):
         self.stop = stop
         self.store = store
@@ -1535,6 +1536,7 @@ class GridChecker:
         self.spec = spec
         self.sell_prefix = sell_prefix
         self.max_unclosed_per_grid = max_unclosed_per_grid
+        self.take_profit_available_size = take_profit_available_size
 
     def run(self) -> None:
         while not self.stop.is_set():
@@ -1555,9 +1557,14 @@ class GridChecker:
                     self.reference, current, self.step_pct,
                     self.take_profit_grid_count, self.spec,
                 )
+                available_size = (
+                    self.take_profit_available_size()
+                    if self.take_profit_available_size is not None else None
+                )
                 reconcile_take_profits(
                     self.api, self.store, self.pair, self.code, current, upper,
                     self.spec, self.sell_prefix, self.take_profit_count,
+                    available_size,
                 )
             except Exception as exc:
                 detail = (
@@ -1726,6 +1733,7 @@ def reconcile_take_profits(
     spec: PairSpec,
     prefix: str,
     limit: int,
+    available_size: Optional[Decimal] = None,
 ) -> None:
     for row in store.active(pair, code):
         if (
@@ -1791,10 +1799,28 @@ def reconcile_take_profits(
         "ORDER BY CAST(tp_price AS REAL)",
         tuple(selected_ids),
     )
+    remaining_capacity = available_size
+    if remaining_capacity is not None:
+        remaining_capacity = max(Decimal("0"), remaining_capacity)
+        for row in rows:
+            if row["tp_status"] == TP_OPEN and not row["completed"]:
+                remaining_capacity = max(
+                    Decimal("0"),
+                    remaining_capacity - Decimal(row["remaining_size"]),
+                )
     for row in rows:
         if row["tp_status"] in {TP_OPEN, TP_SUBMITTING} or row["completed"]:
             continue
-        submit_take_profit(api, store, row, pair, code, spec, prefix)
+        size = Decimal(row["remaining_size"])
+        if remaining_capacity is not None and size > remaining_capacity:
+            print(
+                f"[{now_text()}] 实际持仓可用数量={remaining_capacity}，"
+                f"暂不新增止盈：记录={row['id']}，需要={size}"
+            )
+            continue
+        if submit_take_profit(api, store, row, pair, code, spec, prefix):
+            if remaining_capacity is not None:
+                remaining_capacity -= size
 
 
 def trim_outside_grid(

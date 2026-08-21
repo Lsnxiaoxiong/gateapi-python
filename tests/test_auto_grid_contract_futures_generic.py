@@ -55,6 +55,9 @@ class FakeFuturesApi:
             finish_as=None,
         )
 
+    def get_position(self, settle, contract, **kwargs):
+        return SimpleNamespace(size="2")
+
 
 def spot_style_order(side):
     return SimpleNamespace(
@@ -193,5 +196,36 @@ def test_futures_grid_uses_shared_atomic_activity_limit():
             assert store.activity_count(
                 "SOXL_USDT", "code", Decimal("100")
             ) == 1
+        finally:
+            store.close()
+
+
+def test_zero_actual_position_closes_stale_filled_cycles():
+    class EmptyPositionApi(FakeFuturesApi):
+        def get_position(self, settle, contract, **kwargs):
+            return SimpleNamespace(size="0")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = core.GridStore(Path(temp_dir) / "futures-grid.sqlite3")
+        try:
+            row_id = store.insert_buy(
+                "SOXL_USDT", "code",
+                SimpleNamespace(id="buy-1", text="t-fbcode-buy"),
+                core.PlannedOrder(Decimal("100"), Decimal("2")),
+                Decimal("100.3"),
+            )
+            store.execute(
+                "UPDATE grid_cycles SET buy_status=?,remaining_size=?,tp_status=? "
+                "WHERE id=?",
+                (core.BUY_FILLED, "2", core.TP_WAIT_PLACE, row_id),
+            )
+            api = futures_grid.FuturesGridApi(EmptyPositionApi(), "usdt")
+            assert futures_grid.reconcile_futures_position(
+                api, store, "SOXL_USDT", "code", "long"
+            ) == Decimal("0")
+            row = store.one(row_id)
+            assert row["completed"]
+            assert row["tp_status"] == futures_grid.TP_EXTERNALLY_CLOSED
+            assert store.active("SOXL_USDT", "code") == []
         finally:
             store.close()
