@@ -307,6 +307,26 @@ def reconcile_futures_position(
     direction: str,
 ) -> Decimal:
     """以 Gate 实际仓位为准清理失联周期，并返回可用于新平仓单的数量。"""
+    # GridChecker、WebSocket 监听器可能同时触发持仓对账。对同一个数据库串行
+    # 执行完整对账，避免两个线程按同一份旧快照重复分配实际仓位。
+    with store.lock:
+        reconcile_lock = getattr(store, "_futures_position_reconcile_lock", None)
+        if reconcile_lock is None:
+            reconcile_lock = threading.Lock()
+            store._futures_position_reconcile_lock = reconcile_lock
+    with reconcile_lock:
+        return _reconcile_futures_position_locked(
+            api, store, pair, code, direction
+        )
+
+
+def _reconcile_futures_position_locked(
+    api: FuturesGridApi,
+    store: core.GridStore,
+    pair: str,
+    code: str,
+    direction: str,
+) -> Decimal:
     actual_size = api.get_directional_position_size(pair, direction)
     rows = [
         row for row in store.active(pair, code)
@@ -338,7 +358,72 @@ def reconcile_futures_position(
         print(
             f"[{core.now_text()}] 合约实际{('多' if direction == 'long' else '空')}仓="
             f"{actual_size}，数据库待平数量={expected_size}；"
-            "仅按实际仓位剩余数量补平仓单"
+            "开始清理超额数据库周期"
+        )
+        # 合约仓位不能按每次开仓逐笔区分。优先把真实仓位分配给已经存在
+        # Gate 止盈单的周期，其次保留较早记录；超出实际仓位的记录必须完成，
+        # 否则 activity_count 会一直把这些空仓记录当成网格占位。
+        priority = {
+            core.TP_OPEN: 0,
+            core.TP_SUBMITTING: 1,
+        }
+        rows.sort(key=lambda row: (
+            priority.get(row["tp_status"], 2), row["created_at"], row["id"]
+        ))
+        capacity = actual_size
+        closed_count = 0
+        adjusted_count = 0
+        for original in rows:
+            row = store.one(int(original["id"]))
+            if row is None or row["completed"]:
+                continue
+            recorded_size = Decimal(row["remaining_size"])
+            if capacity >= recorded_size:
+                capacity -= recorded_size
+                continue
+
+            # 若该记录已有大于剩余真实仓位的止盈单，先撤单，避免调整数据库
+            # 后 Gate 上仍保留超量 reduce-only 委托。
+            if row["tp_status"] == core.TP_OPEN and row["tp_order_id"]:
+                result = core.cancel_api_order(
+                    api, pair, row["tp_order_id"], ignore_absent=True
+                )
+                if result is not None:
+                    core.mark_tp_result(store, row, result)
+                row = store.one(int(original["id"]))
+                if row is None or row["completed"]:
+                    continue
+                recorded_size = Decimal(row["remaining_size"])
+
+            keep_size = min(capacity, recorded_size)
+            if keep_size > 0:
+                store.execute(
+                    "UPDATE grid_cycles SET remaining_size=?,tp_order_id=NULL,"
+                    "tp_order_text=NULL,tp_status=?,position_status=?,updated_at=? "
+                    "WHERE id=? AND completed=0",
+                    (
+                        core.decimal_text(keep_size), core.TP_WAIT_PLACE,
+                        core.POSITION_WAIT_TP_ORDER, time.time(), row["id"],
+                    ),
+                )
+                adjusted_count += 1
+                capacity -= keep_size
+                continue
+
+            store.execute(
+                "UPDATE grid_cycles SET remaining_size='0',tp_order_id=NULL,"
+                "tp_order_text=NULL,tp_status=?,position_status=?,completed=1,"
+                "updated_at=? WHERE id=? AND completed=0",
+                (
+                    TP_EXTERNALLY_CLOSED, POSITION_EXTERNALLY_CLOSED,
+                    time.time(), row["id"],
+                ),
+            )
+            closed_count += 1
+        print(
+            f"[{core.now_text()}] 仓位对账完成：关闭超额周期={closed_count}，"
+            f"调整剩余数量周期={adjusted_count}，数据库待平数量已对齐至="
+            f"{actual_size - capacity}"
         )
     return actual_size
 

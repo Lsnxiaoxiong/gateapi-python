@@ -11,9 +11,8 @@ scp -P 23334 D:\source\gateapi-python\example\auto_grid_futures_generic.py root@
 
 
 
-sudo nano /etc/systemd/system/gate-grid-skhynix.service
-sudo nano /etc/systemd/system/gate-grid-aio.service
-sudo nano /etc/systemd/system/gate-grid-soxl.service
+sudo nano /etc/systemd/system/gate-grid-eth.service
+sudo nano /etc/systemd/system/gate-grid-trump.service
 
 sudo systemctl daemon-reload
 sudo systemctl enable gate-grid-bot

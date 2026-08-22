@@ -297,6 +297,16 @@ class ShortFuturesGridApi:
     get_directional_position_size = ref.FuturesGridApi.get_directional_position_size
 
 
+def reconcile_short_position(
+    api: ShortFuturesGridApi,
+    store: core.GridStore,
+    pair: str,
+    code: str,
+) -> Decimal:
+    """按 Gate 实际空仓清理数据库超额周期并返回可平仓张数。"""
+    return ref.reconcile_futures_position(api, store, pair, code, "short")
+
+
 def create_futures_limit_order(
     api: ShortFuturesGridApi,
     pair: str,
@@ -666,8 +676,8 @@ class ShortOrderListener:
         ):
             return
         current = self.price_state.get()
-        available_size = ref.reconcile_futures_position(
-            self.api, self.store, self.pair, self.code, "short"
+        available_size = reconcile_short_position(
+            self.api, self.store, self.pair, self.code
         )
         if available_size <= 0:
             return
@@ -1221,8 +1231,8 @@ def run_short_grid(
         short_grid_count, take_profit_grid_count, take_profit_count,
         contract_spec.grid_spec, cover_client_order_prefix,
         max_unclosed_per_grid,
-        take_profit_available_size=lambda: ref.reconcile_futures_position(
-            apis[1], store, contract, code, "short"
+        take_profit_available_size=lambda: reconcile_short_position(
+            apis[1], store, contract, code
         ),
     )
     order_listener = ShortOrderListener(

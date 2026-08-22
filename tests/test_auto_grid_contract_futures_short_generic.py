@@ -139,3 +139,53 @@ def test_resume_rejects_only_when_multiple_database_strategies_are_ambiguous():
                 raise AssertionError("多个未完成策略时必须拒绝模糊恢复")
         finally:
             store.close()
+
+
+def test_short_position_reconcile_releases_cycles_without_actual_short_position():
+    class OneShortPositionApi(FakeFuturesApi):
+        def get_position(self, settle, contract, **kwargs):
+            return SimpleNamespace(size="-0.1")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = core.GridStore(Path(temp_dir) / "short-grid.sqlite3")
+        try:
+            row_ids = []
+            for index, price in enumerate(("101", "102", "103"), 1):
+                row_id = store.insert_buy(
+                    "SOXL_USDT", "code",
+                    SimpleNamespace(
+                        id="short-%s" % index, text="t-sscode-%s" % index
+                    ),
+                    core.PlannedOrder(Decimal(price), Decimal("0.1")),
+                    Decimal(price) - Decimal("0.3"),
+                )
+                store.execute(
+                    "UPDATE grid_cycles SET buy_status=?,remaining_size=?,tp_status=? "
+                    "WHERE id=?",
+                    (core.BUY_FILLED, "0.1", core.TP_WAIT_PLACE, row_id),
+                )
+                row_ids.append(row_id)
+            store.execute(
+                "UPDATE grid_cycles SET tp_order_id=?,tp_order_text=?,tp_status=? "
+                "WHERE id=?",
+                ("cover-live", "t-stcode", core.TP_OPEN, row_ids[-1]),
+            )
+
+            api = short_grid.ShortFuturesGridApi(OneShortPositionApi(), "usdt")
+            assert short_grid.reconcile_short_position(
+                api, store, "SOXL_USDT", "code"
+            ) == Decimal("0.1")
+
+            active = store.active("SOXL_USDT", "code")
+            assert len(active) == 1
+            assert active[0]["id"] == row_ids[-1]
+            assert active[0]["tp_order_id"] == "cover-live"
+            assert sum(store.one(row_id)["completed"] for row_id in row_ids) == 2
+            assert store.activity_count(
+                "SOXL_USDT", "code", Decimal("101")
+            ) == 0
+            assert store.activity_count(
+                "SOXL_USDT", "code", Decimal("102")
+            ) == 0
+        finally:
+            store.close()

@@ -229,3 +229,92 @@ def test_zero_actual_position_closes_stale_filled_cycles():
             assert store.active("SOXL_USDT", "code") == []
         finally:
             store.close()
+
+
+def test_smaller_actual_position_releases_stale_grid_activity():
+    class OneContractPositionApi(FakeFuturesApi):
+        def get_position(self, settle, contract, **kwargs):
+            return SimpleNamespace(size="0.1")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = core.GridStore(Path(temp_dir) / "futures-grid.sqlite3")
+        try:
+            row_ids = []
+            for index, price in enumerate(("100", "99", "98"), 1):
+                row_id = store.insert_buy(
+                    "SOXL_USDT", "code",
+                    SimpleNamespace(
+                        id="buy-%s" % index, text="t-fbcode-%s" % index
+                    ),
+                    core.PlannedOrder(Decimal(price), Decimal("0.1")),
+                    Decimal(price) + Decimal("0.3"),
+                )
+                store.execute(
+                    "UPDATE grid_cycles SET buy_status=?,remaining_size=?,tp_status=? "
+                    "WHERE id=?",
+                    (core.BUY_FILLED, "0.1", core.TP_WAIT_PLACE, row_id),
+                )
+                row_ids.append(row_id)
+            # 实际仓位只能覆盖一个周期时，优先保留已有真实止盈挂单的记录，
+            # 其余数据库残留不能继续占用对应买入网格。
+            store.execute(
+                "UPDATE grid_cycles SET tp_order_id=?,tp_order_text=?,tp_status=? "
+                "WHERE id=?",
+                ("tp-live", "t-ftcode", core.TP_OPEN, row_ids[-1]),
+            )
+
+            api = futures_grid.FuturesGridApi(OneContractPositionApi(), "usdt")
+            assert futures_grid.reconcile_futures_position(
+                api, store, "SOXL_USDT", "code", "long"
+            ) == Decimal("0.1")
+
+            active = store.active("SOXL_USDT", "code")
+            assert len(active) == 1
+            assert active[0]["id"] == row_ids[-1]
+            assert active[0]["tp_order_id"] == "tp-live"
+            assert Decimal(active[0]["remaining_size"]) == Decimal("0.1")
+            assert sum(store.one(row_id)["completed"] for row_id in row_ids) == 2
+            assert store.activity_count(
+                "SOXL_USDT", "code", Decimal("100")
+            ) == 0
+            assert store.activity_count(
+                "SOXL_USDT", "code", Decimal("99")
+            ) == 0
+        finally:
+            store.close()
+
+
+def test_position_reconcile_keeps_only_partial_last_cycle():
+    class PartialPositionApi(FakeFuturesApi):
+        def get_position(self, settle, contract, **kwargs):
+            return SimpleNamespace(size="0.15")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = core.GridStore(Path(temp_dir) / "futures-grid.sqlite3")
+        try:
+            for index, price in enumerate(("100", "99", "98"), 1):
+                row_id = store.insert_buy(
+                    "SOXL_USDT", "code",
+                    SimpleNamespace(id="buy-%s" % index, text="t-fbcode"),
+                    core.PlannedOrder(Decimal(price), Decimal("0.1")),
+                    Decimal(price) + Decimal("0.3"),
+                )
+                store.execute(
+                    "UPDATE grid_cycles SET buy_status=?,remaining_size=?,tp_status=? "
+                    "WHERE id=?",
+                    (core.BUY_FILLED, "0.1", core.TP_WAIT_PLACE, row_id),
+                )
+
+            api = futures_grid.FuturesGridApi(PartialPositionApi(), "usdt")
+            futures_grid.reconcile_futures_position(
+                api, store, "SOXL_USDT", "code", "long"
+            )
+
+            sizes = sorted(
+                Decimal(row["remaining_size"])
+                for row in store.active("SOXL_USDT", "code")
+            )
+            assert sizes == [Decimal("0.05"), Decimal("0.1")]
+            assert sum(sizes) == Decimal("0.15")
+        finally:
+            store.close()
