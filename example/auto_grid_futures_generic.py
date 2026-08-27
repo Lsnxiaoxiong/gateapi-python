@@ -77,6 +77,7 @@ WAIT_TP = TP_OPEN
 TP_FILLED = "止盈已成交"
 TP_CANCELLED = "止盈单已取消"
 TP_DUST = "止盈部分成交、剩余低于最小下单金额"
+TP_DUST_REJECTED = "碎片止盈被Gate最小下单限制拒绝"
 
 
 @dataclass(frozen=True)
@@ -353,13 +354,14 @@ def strategy_code(
     leverage: Decimal,
     grid_tag: str,
     max_unclosed_per_grid: int = 2,
+    account_mode: str = "margin",
 ) -> str:
     exposure_suffix = (
         "" if max_unclosed_per_grid == 2
         else f"|max-unclosed={max_unclosed_per_grid}"
     )
     raw = (
-        f"{grid_tag}|db-margin|{currency_pair}|{decimal_text(reference)}|"
+        f"{grid_tag}|db-{account_mode}|{currency_pair}|{decimal_text(reference)}|"
         f"{decimal_text(step_pct)}|{decimal_text(take_profit_pct)}|"
         f"{decimal_text(margin)}|{decimal_text(leverage)}{exposure_suffix}"
     )
@@ -670,7 +672,7 @@ class GridStore:
                 "AND tp_status IN (?,?,?,?)",
                 (
                     TP_SUBMITTING, POSITION_WAIT_TP_ORDER, now, row_id, BUY_FILLED,
-                    TP_WAIT_PLACE, TP_NOT_SET, TP_CANCELLED, TP_PLANNED,
+                    TP_WAIT_PLACE, TP_NOT_SET, TP_CANCELLED, TP_DUST,
                 ),
             )
             self.db.commit()
@@ -898,24 +900,32 @@ class StrategyProcessLock:
             self.file = None
 
 
+def api_account_mode(api: SpotApi) -> str:
+    """返回此策略客户端绑定的现货账户类型。"""
+    return str(getattr(api, "_grid_account_mode", "margin"))
+
+
 def api_order(api: SpotApi, pair: str, order_id: str):
+    account_mode = api_account_mode(api)
     return call_with_retry(
         f"查询订单 {order_id}",
         lambda: api.get_order(
-            order_id, pair, account="margin", _request_timeout=NETWORK_TIMEOUT
+            order_id, pair, account=account_mode, _request_timeout=NETWORK_TIMEOUT
         ),
     )
 
 
 def list_order_snapshot(api: SpotApi, pair: str) -> tuple[list, list]:
     """并发获取当前挂单和最近完结订单；缺失记录再由调用方单查。"""
+    account_mode = api_account_mode(api)
+
     def fetch() -> tuple[list, list]:
         open_job = api.list_orders(
-            pair, "open", account="margin", limit=ORDER_SNAPSHOT_LIMIT,
+            pair, "open", account=account_mode, limit=ORDER_SNAPSHOT_LIMIT,
             async_req=True, _request_timeout=NETWORK_TIMEOUT,
         )
         finished_job = api.list_orders(
-            pair, "finished", account="margin", limit=ORDER_SNAPSHOT_LIMIT,
+            pair, "finished", account=account_mode, limit=ORDER_SNAPSHOT_LIMIT,
             async_req=True, _request_timeout=NETWORK_TIMEOUT,
         )
         return list(open_job.get()), list(finished_job.get())
@@ -933,8 +943,10 @@ def cancel_api_order(
     if not order_id:
         return None
     try:
+        account_mode = api_account_mode(api)
         return api.cancel_order(
-            order_id, pair, account="margin", _request_timeout=NETWORK_TIMEOUT
+            order_id, pair, account=account_mode,
+            _request_timeout=NETWORK_TIMEOUT,
         )
     except GateApiException as exc:
         if exc.label not in {"ORDER_NOT_FOUND", "ORDER_CLOSED", "ORDER_CANCELLED"}:
@@ -960,16 +972,19 @@ def create_limit_order(
     order_text: Optional[str] = None,
 ):
     text = order_text or make_order_text(prefix, code)
+    account_mode = api_account_mode(api)
     body = Order(
         currency_pair=pair,
         side=side,
         amount=decimal_text(size),
         price=decimal_text(price),
         type="limit",
-        account="margin",
+        account=account_mode,
         time_in_force="gtc",
         text=text,
-        auto_borrow=auto_borrow if side == "buy" else False,
+        auto_borrow=(
+            auto_borrow if account_mode == "margin" and side == "buy" else False
+        ),
     )
     return api.create_order(body, _request_timeout=NETWORK_TIMEOUT)
 
@@ -1129,6 +1144,7 @@ class OrderListener:
         step_pct: Optional[Decimal] = None,
         take_profit_grid_count: Optional[int] = None,
         take_profit_count: Optional[int] = None,
+        account_mode: Optional[str] = None,
     ):
         self.stop = stop
         self.store = store
@@ -1145,6 +1161,7 @@ class OrderListener:
         self.step_pct = step_pct
         self.take_profit_grid_count = take_profit_grid_count
         self.take_profit_count = take_profit_count
+        self.account_name = account_mode or type(self).account_name
         self.pending_events: dict[str, tuple[dict, float]] = {}
 
     def _maintain_take_profits_after_buy_fill(self) -> None:
@@ -1341,6 +1358,29 @@ class OrderListener:
             if result is None and exact_missing:
                 try:
                     result = api_order(self.api, self.pair, order_id)
+                except GateApiException as exc:
+                    if exc.label != "ORDER_NOT_FOUND":
+                        print(
+                            f"[{now_text()}] OrderListener 补查订单 {order_id} "
+                            f"失败：{exc}"
+                        )
+                        continue
+                    missing = SimpleNamespace(
+                        status="cancelled", filled_amount="0", amount="0", left="0"
+                    )
+                    if kind == "buy":
+                        mark_buy_result(self.store, row, missing)
+                        print(
+                            f"[{now_text()}] Gate中不存在买单 {order_id}，"
+                            "已清理本地待成交记录"
+                        )
+                    else:
+                        mark_tp_result(self.store, row, missing)
+                        print(
+                            f"[{now_text()}] Gate中不存在止盈单 {order_id}，"
+                            "已恢复为等待重新挂单"
+                        )
+                    continue
                 except Exception as exc:
                     print(
                         f"[{now_text()}] OrderListener 补查订单 {order_id} 失败：{exc}"
@@ -1656,6 +1696,7 @@ def submit_take_profit(
     code: str,
     spec: PairSpec,
     prefix: str,
+    allow_below_minimum: bool = False,
 ) -> bool:
     """为一个已成交买单挂止盈；数据库抢占确保监听器和检查器不会重复下单。"""
     refreshed = store.one(int(row["id"]))
@@ -1669,7 +1710,10 @@ def submit_take_profit(
     size = Decimal(refreshed["remaining_size"])
     price = Decimal(refreshed["tp_price"])
     notional = size * price
-    if size < spec.min_base_amount or notional < spec.min_quote_amount:
+    below_minimum = (
+        size < spec.min_base_amount or notional < spec.min_quote_amount
+    )
+    if below_minimum and not allow_below_minimum:
         store.execute(
             "UPDATE grid_cycles SET tp_status=?,position_status=?,updated_at=? "
             "WHERE id=?",
@@ -1694,10 +1738,13 @@ def submit_take_profit(
             store.execute(
                 "UPDATE grid_cycles SET tp_status=?,position_status=?,updated_at=? "
                 "WHERE id=?",
-                (TP_DUST, POSITION_WAIT_TP_ORDER, time.time(), refreshed["id"]),
+                (
+                    TP_DUST_REJECTED, POSITION_WAIT_TP_ORDER,
+                    time.time(), refreshed["id"],
+                ),
             )
             print(
-                f"[{now_text()}] Gate拒绝过小止盈，已转为碎片："
+                f"[{now_text()}] Gate拒绝碎片止盈，无法创建低于最小限制的卖单："
                 f"记录={refreshed['id']}，数量={size}，金额="
                 f"{decimal_text(notional)} USDT"
             )
@@ -1717,7 +1764,8 @@ def submit_take_profit(
         store.release_take_profit_claim(int(refreshed["id"]))
         raise
     print(
-        f"[{now_text()}] 设置止盈：买价={refreshed['buy_price']}，"
+        f"[{now_text()}] 设置{'碎片' if below_minimum else ''}止盈："
+        f"买价={refreshed['buy_price']}，"
         f"卖价={price}，id={order.id}"
     )
     return True
@@ -1735,6 +1783,13 @@ def reconcile_take_profits(
     limit: int,
     available_size: Optional[Decimal] = None,
 ) -> None:
+    def below_minimum(row) -> bool:
+        size = Decimal(row["remaining_size"])
+        return (
+            size < spec.min_base_amount
+            or size * Decimal(row["tp_price"]) < spec.min_quote_amount
+        )
+
     for row in store.active(pair, code):
         if (
             row["buy_status"] != BUY_FILLED
@@ -1747,7 +1802,7 @@ def reconcile_take_profits(
         notional = size * price
         if size >= spec.min_base_amount and notional >= spec.min_quote_amount:
             continue
-        if row["tp_status"] != TP_DUST:
+        if row["tp_status"] not in {TP_DUST, TP_DUST_REJECTED}:
             store.execute(
                 "UPDATE grid_cycles SET tp_order_id=NULL,tp_order_text=NULL,"
                 "tp_status=?,position_status=?,updated_at=? WHERE id=?",
@@ -1761,6 +1816,21 @@ def reconcile_take_profits(
                 f"最低金额={decimal_text(spec.min_quote_amount)} USDT"
             )
 
+    # 碎片止盈独立于普通止盈名额；始终使用产生碎片的买单原始止盈价。
+    # 先尝试提交一次。若 Gate 明确执行最小金额限制，则保留拒绝状态，
+    # 不进行高频无效重试，也不虚报为已挂单。
+    for row in store.active(pair, code):
+        if (
+            row["buy_status"] == BUY_FILLED
+            and row["tp_status"] == TP_DUST
+            and row["tp_order_id"] is None
+            and Decimal(row["remaining_size"]) > 0
+        ):
+            submit_take_profit(
+                api, store, row, pair, code, spec, prefix,
+                allow_below_minimum=True,
+            )
+
     eligible = [
         row for row in store.active(pair, code)
         if row["buy_status"] == BUY_FILLED
@@ -1769,6 +1839,7 @@ def reconcile_take_profits(
         }
         and current < Decimal(row["tp_price"]) <= upper_price
         and Decimal(row["remaining_size"]) > 0
+        and not below_minimum(row)
     ]
     # 已挂止盈也参与排序，使有限名额始终留给最接近现价的止盈价。
     eligible.extend(
@@ -1777,12 +1848,17 @@ def reconcile_take_profits(
         and row["tp_status"] == TP_OPEN
         and current < Decimal(row["tp_price"]) <= upper_price
         and Decimal(row["remaining_size"]) > 0
+        and not below_minimum(row)
     )
     eligible.sort(key=lambda row: Decimal(row["tp_price"]) - current)
     selected_ids = {row["id"] for row in eligible[:limit]}
 
     for row in store.active(pair, code):
-        if row["tp_status"] != TP_OPEN or row["id"] in selected_ids:
+        if (
+            row["tp_status"] != TP_OPEN
+            or row["id"] in selected_ids
+            or below_minimum(row)
+        ):
             continue
         result = cancel_api_order(api, pair, row["tp_order_id"])
         mark_tp_result(store, row, result)
@@ -1917,8 +1993,12 @@ def run_grid(
     database_path: Path = DEFAULT_DATABASE,
     poll_interval: float = 2.5,
     max_cycles: Optional[int] = None,
+    account_mode: str = "margin",
 ) -> None:
     pair = str(currency_pair).strip().upper().replace("-", "_")
+    account_mode = str(account_mode).strip().lower()
+    if account_mode not in {"spot", "margin"}:
+        raise ValueError("account_mode 只能是 spot 或 margin")
     startup_mode = str(startup_mode).strip().lower()
     if startup_mode not in {"resume", "reset"}:
         raise ValueError("startup_mode 只能是 resume 或 reset")
@@ -1941,6 +2021,10 @@ def run_grid(
     reference = decimal_value("reference_price", reference_price)
     margin = decimal_value("margin_amount_per_order", margin_amount_per_order)
     leverage_value = decimal_value("leverage", leverage)
+    if account_mode == "spot" and leverage_value != Decimal("1"):
+        raise ValueError("普通现货模式的 leverage 必须为 1")
+    if account_mode == "spot" and auto_borrow:
+        raise ValueError("普通现货模式不能启用 auto_borrow")
     step_pct = decimal_value("grid_step_pct", grid_step_pct)
     tp_pct = decimal_value("take_profit_pct", take_profit_pct)
     if step_pct >= 1 or tp_pct >= 1:
@@ -1986,7 +2070,9 @@ def run_grid(
     checker_api = SpotApi(checker_client)
     listener_api = SpotApi(listener_client)
     state_api = SpotApi(state_client)
-    margin_api = MarginApi(main_client)
+    for spot_api in (api, checker_api, listener_api, state_api):
+        setattr(spot_api, "_grid_account_mode", account_mode)
+    margin_api = MarginApi(main_client) if account_mode == "margin" else None
     try:
         process_lock.acquire()
     except Exception:
@@ -2006,7 +2092,7 @@ def run_grid(
         raise
     code = strategy_code(
         pair, reference, step_pct, tp_pct, margin, leverage_value, grid_tag,
-        max_unclosed_per_grid,
+        max_unclosed_per_grid, account_mode,
     )
     price_state = PriceState(current)
 
@@ -2021,12 +2107,14 @@ def run_grid(
         buy_client_order_prefix, sell_client_order_prefix, ws_url,
         price_state, reference, step_pct, take_profit_grid_count,
         take_profit_count,
+        account_mode,
     )
     state_reconciler = OrderListener(
         stop, store, state_api, pair, code, spec, tp_pct,
         buy_client_order_prefix, sell_client_order_prefix, ws_url,
         price_state, reference, step_pct, take_profit_grid_count,
         take_profit_count,
+        account_mode,
     )
     order_state_checker = OrderStateChecker(stop, state_reconciler)
     checker = threading.Thread(
@@ -2046,9 +2134,10 @@ def run_grid(
         daemon=True,
     )
     try:
-        configure_margin_settings(
-            margin_api, pair, leverage_value, auto_repay
-        )
+        if margin_api is not None:
+            configure_margin_settings(
+                margin_api, pair, leverage_value, auto_repay
+            )
         if startup_mode == "reset":
             reset_pair(api, store, pair)
         else:
@@ -2103,13 +2192,27 @@ def run_grid(
                     }
                     for row in rows
                 )
-                dust_tps = sum(row["tp_status"] == TP_DUST for row in rows)
+                dust_tps = sum(
+                    row["tp_status"] in {TP_DUST, TP_DUST_REJECTED}
+                    for row in rows
+                )
+                dust_open_tps = sum(
+                    row["tp_status"] == TP_OPEN
+                    and (
+                        Decimal(row["remaining_size"]) < spec.min_base_amount
+                        or Decimal(row["remaining_size"])
+                        * Decimal(row["tp_price"]) < spec.min_quote_amount
+                    )
+                    for row in rows
+                )
+                open_tps -= dust_open_tps
                 print(
                     f"[{now_text()}] 当前价={current}，"
                     f"买单={pending_buys}/{buy_grid_count}，"
                     f"止盈单={open_tps}/{take_profit_count}，"
                     f"止盈区间=({current},{tp_upper}]，"
-                    f"等待止盈={waiting_tps}，止盈碎片={dust_tps}，"
+                    f"等待止盈={waiting_tps}，碎片止盈单={dust_open_tps}，"
+                    f"未挂碎片={dust_tps}，"
                     f"活动周期={len(rows)}"
                 )
                 failures = 0

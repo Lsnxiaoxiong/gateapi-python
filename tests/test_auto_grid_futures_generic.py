@@ -465,7 +465,7 @@ class DatabaseGridTest(unittest.TestCase):
     def test_tp_window_keeps_nearest_ten_and_cancels_two_farthest(self):
         row_ids = []
         for index, price in enumerate(range(91, 103), start=1):
-            row_id = self.insert(price=str(price), size="0.03")
+            row_id = self.insert(price=str(price), size="0.04")
             row_ids.append(row_id)
             self.store.execute(
                 "UPDATE grid_cycles SET buy_status=?,position_status=?,"
@@ -518,7 +518,7 @@ class DatabaseGridTest(unittest.TestCase):
         self.assertEqual(grid.TP_WAIT_PLACE, row["tp_status"])
         self.assertIsNone(row["tp_order_id"])
 
-    def test_subminimum_take_profit_is_marked_as_dust_and_not_submitted(self):
+    def test_subminimum_take_profit_is_submitted_at_original_tp_price(self):
         row_id = self.insert(price="100", size="0.004")
         self.store.execute(
             "UPDATE grid_cycles SET buy_status=?,tp_status=? WHERE id=?",
@@ -526,19 +526,81 @@ class DatabaseGridTest(unittest.TestCase):
         )
 
         class FakeApi:
-            def create_order(self, *args, **kwargs):
-                raise AssertionError("碎片止盈不应提交到交易所")
+            def create_order(self, order, **kwargs):
+                self.order = order
+                return SimpleNamespace(id="dust-tp", text=order.text)
 
+        api = FakeApi()
         grid.reconcile_take_profits(
-            FakeApi(), self.store, "ETH_USDT", "code",
+            api, self.store, "ETH_USDT", "code",
             Decimal("99"), Decimal("105"), self.spec, "dt", 10,
         )
         row = self.store.rows(
             "SELECT * FROM grid_cycles WHERE id=?", (row_id,)
         )[0]
-        self.assertEqual(grid.TP_DUST, row["tp_status"])
+        self.assertEqual(grid.TP_OPEN, row["tp_status"])
+        self.assertEqual("100.3", api.order.price)
         self.assertEqual("0.004", row["remaining_size"])
         self.assertFalse(row["completed"])
+
+    def test_dust_take_profit_does_not_consume_normal_tp_limit(self):
+        dust_id = self.insert(price="100", size="0.004")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,tp_status=? WHERE id=?",
+            (grid.BUY_FILLED, grid.TP_DUST, dust_id),
+        )
+        for price in range(101, 111):
+            row_id = self.insert(price=str(price), size="0.03")
+            self.store.execute(
+                "UPDATE grid_cycles SET buy_status=?,tp_status=? WHERE id=?",
+                (grid.BUY_FILLED, grid.TP_WAIT_PLACE, row_id),
+            )
+
+        class FakeApi:
+            def __init__(self):
+                self.orders = []
+
+            def create_order(self, order, **kwargs):
+                self.orders.append(order)
+                return SimpleNamespace(
+                    id=f"tp-{len(self.orders)}", text=order.text
+                )
+
+        api = FakeApi()
+        grid.reconcile_take_profits(
+            api, self.store, "ETH_USDT", "code",
+            Decimal("90"), Decimal("120"), self.spec, "dt", 10,
+        )
+        self.assertEqual(11, len(api.orders))
+        self.assertEqual(
+            11,
+            sum(
+                row["tp_status"] == grid.TP_OPEN
+                for row in self.store.active("ETH_USDT", "code")
+            ),
+        )
+
+    def test_gate_minimum_rejection_is_not_retried_as_open_order(self):
+        row_id = self.insert(price="100", size="0.004")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,tp_status=? WHERE id=?",
+            (grid.BUY_FILLED, grid.TP_DUST, row_id),
+        )
+
+        class FakeApi:
+            def create_order(self, *args, **kwargs):
+                parent = grid.ApiException(status=400, reason="Bad Request")
+                raise grid.GateApiException(
+                    "INVALID_PARAM_VALUE", "order amount is too small", exp=parent
+                )
+
+        grid.reconcile_take_profits(
+            FakeApi(), self.store, "ETH_USDT", "code",
+            Decimal("99"), Decimal("105"), self.spec, "dt", 10,
+        )
+        row = self.store.one(row_id)
+        self.assertEqual(grid.TP_DUST_REJECTED, row["tp_status"])
+        self.assertIsNone(row["tp_order_id"])
 
     def test_order_snapshot_uses_open_and_finished_list_queries(self):
         class Job:
@@ -563,6 +625,41 @@ class DatabaseGridTest(unittest.TestCase):
         self.assertEqual(["open", "finished"], [item[1] for item in api.statuses])
         self.assertTrue(all(item[0] == "ETH_USDT" for item in api.statuses))
         self.assertTrue(all(item[2]["async_req"] for item in api.statuses))
+
+    def test_spot_order_snapshot_uses_spot_account(self):
+        class Job:
+            def get(self):
+                return []
+
+        class FakeApi:
+            _grid_account_mode = "spot"
+
+            def __init__(self):
+                self.accounts = []
+
+            def list_orders(self, pair, status, **kwargs):
+                self.accounts.append(kwargs["account"])
+                return Job()
+
+        api = FakeApi()
+        grid.list_order_snapshot(api, "ETH5L_USDT")
+        self.assertEqual(["spot", "spot"], api.accounts)
+
+    def test_spot_limit_order_disables_auto_borrow(self):
+        class FakeApi:
+            _grid_account_mode = "spot"
+
+            def create_order(self, body, **kwargs):
+                self.body = body
+                return SimpleNamespace(id="1")
+
+        api = FakeApi()
+        grid.create_limit_order(
+            api, "ETH5L_USDT", "buy", Decimal("0.03"), Decimal("100"),
+            True, "db", "code",
+        )
+        self.assertEqual("spot", api.body.account)
+        self.assertFalse(api.body.auto_borrow)
 
     def test_reconciliation_ignores_orders_from_another_pair(self):
         self.insert(price="100", size="0.03")
@@ -994,6 +1091,8 @@ class DatabaseGridTest(unittest.TestCase):
         self.assertNotEqual(first, changed)
         changed_limit = grid.strategy_code(*args, max_unclosed_per_grid=3)
         self.assertNotEqual(first, changed_limit)
+        spot = grid.strategy_code(*args, account_mode="spot")
+        self.assertNotEqual(first, spot)
 
     def test_process_lock_rejects_second_instance(self):
         path = Path(self.temp.name) / "ETH_USDT.lock"
@@ -1041,6 +1140,45 @@ class DatabaseGridTest(unittest.TestCase):
                 "SELECT * FROM grid_cycles WHERE currency_pair='ETH_USDT'"
             )
         )
+
+    def test_reconciliation_requeues_take_profit_missing_from_gate(self):
+        row_id = self.insert(price="100", size="0.03")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,position_status=?,tp_status=?,"
+            "tp_order_id='missing-tp' WHERE id=?",
+            (
+                grid.BUY_FILLED, grid.POSITION_WAIT_TP, grid.TP_OPEN, row_id,
+            ),
+        )
+
+        class Job:
+            def get(self):
+                return []
+
+        class FakeApi:
+            def list_orders(self, *args, **kwargs):
+                return Job()
+
+            def get_order(self, *args, **kwargs):
+                parent = grid.ApiException(status=404, reason="Not Found")
+                raise grid.GateApiException(
+                    "ORDER_NOT_FOUND", "Order not found", exp=parent
+                )
+
+            def cancel_order(self, *args, **kwargs):
+                raise AssertionError("不存在的止盈单无需再次撤销")
+
+        listener = grid.OrderListener(
+            grid.threading.Event(), self.store, FakeApi(),
+            "ETH_USDT", "code", self.spec, Decimal("0.003"),
+            "db", "dt", "wss://example.test/ws",
+        )
+        listener.reconcile_rest(exact_missing=True)
+
+        row = self.store.one(row_id)
+        self.assertEqual(grid.TP_WAIT_PLACE, row["tp_status"])
+        self.assertEqual(grid.POSITION_WAIT_TP_ORDER, row["position_status"])
+        self.assertIsNone(row["tp_order_id"])
 
     def test_margin_startup_enables_auto_repay(self):
         class FakeMarginApi:
