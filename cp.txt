@@ -34,6 +34,8 @@ sudo systemctl status gate-grid-bot
 sudo journalctl -u gate-grid-skhynix -f
 sudo journalctl -u gate-grid-bot -f
 sudo journalctl -u gate-grid-hemi -f
-sudo journalctl -u gate-grid-aio -f
-sudo journalctl -u gate-grid-gps -f
+sudo journalctl -u gate-grid-soxl -f
+sudo journalctl -u gate-grid-btc -f
 sudo journalctl -u gate-grid-eth -f
+sudo journalctl -u gate-grid-eth5l -f
+sudo journalctl -u gate-grid-hype -f

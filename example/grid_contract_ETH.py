@@ -5,7 +5,7 @@ def run_ETH() -> None:
     run_grid(
         contract="ETH_USDT",
         reference_price="2385",
-        margin_amount_per_order="1",  # 每格保证金；名义仓位约为保证金×杠杆
+        margin_amount_per_order="6.67",  # 每格保证金；名义仓位约为保证金×杠杆
         leverage="3",
         settle="usdt",
         buy_grid_count=10,
