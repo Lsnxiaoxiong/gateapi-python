@@ -23,6 +23,7 @@ from __future__ import absolute_import
 
 import argparse
 import copy
+import inspect
 import logging
 import os
 import threading
@@ -81,7 +82,14 @@ def create_app() -> FastAPI:
     def _rank_job_snapshot(job_id):
         with rank_jobs_lock:
             job = rank_jobs.get(job_id)
-            return copy.deepcopy(job) if job is not None else None
+            snapshot = copy.deepcopy(job) if job is not None else None
+        if snapshot is not None and snapshot.get("status") == "running":
+            started_at = snapshot.get("started_at")
+            if started_at:
+                snapshot["progress"]["elapsed_seconds"] = round(
+                    time.time() - started_at, 1
+                )
+        return snapshot
 
     def _run_rank_job(job_id, settle, max_workers, end_time, limit,
                       min_market_cap_musd, max_market_cap_musd,
@@ -91,9 +99,34 @@ def create_app() -> FastAPI:
             job = rank_jobs[job_id]
             job["status"] = "running"
             job["started_at"] = started_at
-            if min_market_cap_musd is not None or max_market_cap_musd is not None:
-                job["progress"]["phase"] = "filtering"
-                job["progress"]["current_contract"] = "正在获取 Gate 合约列表与市值"
+            job["progress"]["phase"] = "contracts"
+            job["progress"]["message"] = "正在获取 Gate 合约列表"
+
+        def _stage(event):
+            with rank_jobs_lock:
+                job = rank_jobs.get(job_id)
+                if job is None:
+                    return
+                progress = job["progress"]
+                progress["phase"] = event.get("phase", progress.get("phase"))
+                if event.get("message") is not None:
+                    progress["message"] = event["message"]
+                if "completed" in event:
+                    progress["stage_completed"] = event["completed"]
+                if "total" in event:
+                    progress["stage_total"] = event["total"]
+                if event.get("current_contract") is not None:
+                    progress["current_contract"] = event["current_contract"]
+                stage_total = progress["stage_total"]
+                progress["stage_percent"] = round(
+                    progress["stage_completed"] / stage_total * 100, 1
+                ) if stage_total else 0.0
+                progress["elapsed_seconds"] = round(time.time() - started_at, 1)
+                details = progress.setdefault("details", {})
+                for key, value in event.items():
+                    if key not in ("phase", "message", "completed", "total",
+                                   "current_contract"):
+                        details[key] = value
 
         def _partial_result(result):
             with rank_jobs_lock:
@@ -112,6 +145,7 @@ def create_app() -> FastAPI:
                     return
                 progress = job["progress"]
                 progress["phase"] = "scanning"
+                progress["message"] = "正在下载 %s 的近一年 1h K 线" % contract
                 progress["completed"] = completed
                 progress["total"] = total
                 progress["current_contract"] = contract
@@ -119,6 +153,10 @@ def create_app() -> FastAPI:
                     progress["failed"] += 1
                 progress["successful"] = max(0, completed - progress["failed"])
                 progress["percent"] = round((completed / total) * 100, 1) if total else 100.0
+                progress["stage_completed"] = completed
+                progress["stage_total"] = total
+                progress["stage_percent"] = progress["percent"]
+                progress["elapsed_seconds"] = round(time.time() - started_at, 1)
 
         try:
             rank_kwargs = dict(
@@ -129,6 +167,14 @@ def create_app() -> FastAPI:
                 progress_callback=_progress,
                 result_callback=_partial_result,
             )
+            signature = inspect.signature(rank_futures_by_yearly_low_gain)
+            supports_stage = (
+                "stage_callback" in signature.parameters or
+                any(param.kind == inspect.Parameter.VAR_KEYWORD
+                    for param in signature.parameters.values())
+            )
+            if supports_stage:
+                rank_kwargs["stage_callback"] = _stage
             optional_filters = {
                 "min_market_cap_musd": min_market_cap_musd,
                 "max_market_cap_musd": max_market_cap_musd,
@@ -152,6 +198,11 @@ def create_app() -> FastAPI:
                     "percent": 100.0,
                     "current_contract": None,
                     "phase": "completed",
+                    "message": "扫描完成",
+                    "stage_completed": requested,
+                    "stage_total": requested,
+                    "stage_percent": 100.0,
+                    "elapsed_seconds": round(elapsed, 1),
                 })
                 job["status"] = "completed"
                 job["finished_at"] = time.time()
@@ -320,6 +371,12 @@ def create_app() -> FastAPI:
                     "percent": 0.0,
                     "current_contract": None,
                     "phase": "queued",
+                    "message": "等待开始扫描",
+                    "stage_completed": 0,
+                    "stage_total": initial_total,
+                    "stage_percent": 0.0,
+                    "elapsed_seconds": 0.0,
+                    "details": {},
                 },
                 "report": None,
                 "partial_results": [],
@@ -349,7 +406,9 @@ def create_app() -> FastAPI:
         from tools.market_candlesticks import _default_futures_api
         api = _default_futures_api(None)
         try:
-            raw = await run_in_threadpool(api.list_futures_contracts, settle)
+            raw = await run_in_threadpool(
+                api.list_futures_contracts, settle, _request_timeout=30
+            )
         finally:
             client = getattr(api, "api_client", None)
             close = getattr(client, "close", None) if client else None

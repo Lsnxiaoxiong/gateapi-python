@@ -42,6 +42,27 @@ class _Http(object):
 
 class _MarketCapProviderTests(unittest.TestCase):
 
+    def test_default_provider_prefers_symbol_batch_source(self):
+        provider = market_caps.DefaultMarketCaps()
+        self.assertIsInstance(provider.providers[0], market_caps.CoinLoreMarketCaps)
+        self.assertIsInstance(provider.providers[1], market_caps.CoinGeckoMarketCaps)
+        self.assertEqual(
+            provider.providers[0].max_pages,
+            market_caps.CoinLoreMarketCaps.DEFAULT_MAX_PAGES,
+        )
+
+    def test_coinlore_stops_at_page_budget_when_symbol_is_missing(self):
+        http = _Http(_Response(200, {
+            "data": [
+                {"symbol": "AAA%d" % i, "market_cap_usd": "25000000"}
+                for i in range(100)
+            ],
+            "info": {"coins_num": 9999},
+        }))
+        provider = market_caps.CoinLoreMarketCaps(http=http, max_pages=2)
+        self.assertEqual(provider.get_many(["missing"]), {})
+        self.assertEqual(len(http.calls), 2)
+
     def test_coinpaprika_maps_largest_market_cap_for_duplicate_symbol(self):
         http = _Http(_Response(200, [
             {"symbol": "AAA", "quotes": {"USD": {"market_cap": 10}}},

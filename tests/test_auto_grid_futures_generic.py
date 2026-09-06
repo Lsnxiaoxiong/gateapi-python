@@ -410,6 +410,115 @@ class DatabaseGridTest(unittest.TestCase):
         )
         self.assertGreater(upper, Decimal("99.5"))
 
+    def test_crossed_buy_prices_returns_only_newly_crossed_nearby_grids(self):
+        prices = grid.crossed_buy_prices(
+            Decimal("100"), Decimal("100.5"), Decimal("96.5"),
+            Decimal("0.01"), 3, Decimal("0.01"),
+        )
+        self.assertEqual(
+            [Decimal("99.00"), Decimal("98.01"), Decimal("97.03")], prices
+        )
+        self.assertEqual([], grid.crossed_buy_prices(
+            Decimal("100"), Decimal("99"), Decimal("100"),
+            Decimal("0.01"), 3, Decimal("0.01"),
+        ))
+
+    def test_startup_recovery_scans_nearest_grids_already_above_current(self):
+        self.assertEqual(
+            [Decimal("97.03"), Decimal("98.01"), Decimal("99.00")],
+            grid.favorable_buy_prices_on_startup(
+                Decimal("100"), Decimal("96.5"), Decimal("0.01"),
+                3, Decimal("0.01"),
+            ),
+        )
+
+    def test_crossed_empty_grid_uses_market_buy_and_marks_fill(self):
+        class FakeApi:
+            _grid_account_mode = "spot"
+
+            def create_order(self, body, **kwargs):
+                self.body = body
+                return SimpleNamespace(
+                    id="market-buy", text=body.text, status="closed",
+                    filled_amount="0.031", amount=body.amount, left="0",
+                )
+
+        api = FakeApi()
+        funded = grid.place_crossed_market_buys(
+            api, self.store, "ETH_USDT", "code",
+            [grid.PlannedOrder(Decimal("100"), Decimal("0.03"))],
+            Decimal("3.1"), Decimal("0.003"), self.spec, False, "db", 1,
+        )
+        self.assertTrue(funded)
+        self.assertEqual("market", api.body.type)
+        self.assertEqual("buy", api.body.side)
+        self.assertEqual("3.1", api.body.amount)
+        row = self.store.active("ETH_USDT", "code")[0]
+        self.assertEqual(grid.BUY_FILLED, row["buy_status"])
+        self.assertEqual("0.031", row["remaining_size"])
+        self.assertEqual("100", row["buy_price"])
+
+    def test_crossed_dust_take_profits_are_merged_into_one_market_sell(self):
+        first = self.insert(price="90", size="0.02")
+        second = self.insert(price="91", size="0.02")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,position_status=?,tp_status=? "
+            "WHERE id IN (?,?)",
+            (
+                grid.BUY_FILLED, grid.POSITION_WAIT_TP_ORDER,
+                grid.TP_DUST_REJECTED, first, second,
+            ),
+        )
+
+        class FakeApi:
+            _grid_account_mode = "spot"
+
+            def create_order(self, body, **kwargs):
+                self.body = body
+                return SimpleNamespace(
+                    id="market-tp", text=body.text, status="closed",
+                    filled_amount=body.amount, amount=body.amount, left="0",
+                )
+
+        api = FakeApi()
+        submitted = grid.close_crossed_take_profits_at_market(
+            api, self.store, "ETH_USDT", "code", Decimal("100"),
+            self.spec, "dt",
+        )
+        self.assertTrue(submitted)
+        self.assertEqual("market", api.body.type)
+        self.assertEqual("sell", api.body.side)
+        self.assertEqual("0.04", api.body.amount)
+        rows = self.store.rows(
+            "SELECT * FROM grid_cycles WHERE id IN (?,?) ORDER BY id",
+            (first, second),
+        )
+        self.assertTrue(all(row["completed"] for row in rows))
+        self.assertTrue(all(row["tp_status"] == grid.TP_FILLED for row in rows))
+        # WebSocket 可能在 create_order 返回主线程前已经完成写库；再次绑定必须幂等。
+        self.store.bind_market_take_profits(
+            [first, second], SimpleNamespace(id="market-tp", text=api.body.text)
+        )
+
+    def test_crossed_dust_waits_until_merged_value_reaches_minimum(self):
+        row_id = self.insert(price="90", size="0.02")
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_status=?,tp_status=? WHERE id=?",
+            (grid.BUY_FILLED, grid.TP_DUST_REJECTED, row_id),
+        )
+
+        class FakeApi:
+            _grid_account_mode = "spot"
+
+            def create_order(self, *args, **kwargs):
+                raise AssertionError("合计金额不足时不应提交市价卖单")
+
+        self.assertFalse(grid.close_crossed_take_profits_at_market(
+            FakeApi(), self.store, "ETH_USDT", "code", Decimal("100"),
+            self.spec, "dt",
+        ))
+        self.assertFalse(self.store.one(row_id)["completed"])
+
     def test_tp_above_current_is_eligible_even_when_buy_is_above_current(self):
         row_id = self.insert(price="100", size="0.03")
         self.store.execute(

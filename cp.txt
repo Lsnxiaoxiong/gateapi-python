@@ -9,8 +9,6 @@ scp -P 23334 D:\source\gateapi-python\example\auto_grid_futures_generic.py root@
 
 
 
-
-
 sudo nano /etc/systemd/system/gate-grid-eth.service
 sudo nano /etc/systemd/system/gate-grid-trump.service
 

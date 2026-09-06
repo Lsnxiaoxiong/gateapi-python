@@ -103,7 +103,10 @@ FUTURES_PAGE_SIZE = 1999
 VALID_MARKET_TYPES = ("spot", "futures")
 
 #: Default total request timeout in seconds for a single page request.
-DEFAULT_REQUEST_TIMEOUT = 30.0
+# Keep this an ``int``. The generated Gate SDK currently ignores float timeout
+# values and only converts integers or ``(connect, read)`` tuples to an
+# urllib3.Timeout; using ``30.0`` therefore left requests unbounded.
+DEFAULT_REQUEST_TIMEOUT = 30
 #: Default number of retries for transient errors.
 DEFAULT_MAX_RETRIES = 3
 #: Base backoff in seconds for exponential retry.

@@ -1,0 +1,81 @@
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #e5e7eb;
+  background: #0b1220;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 1180px; background: #0b1220; }
+button, input, select { font: inherit; }
+button { cursor: pointer; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+.app-shell { padding: 18px; min-height: 100vh; }
+.topbar { display: flex; justify-content: space-between; align-items: end; gap: 24px; margin-bottom: 14px; }
+.eyebrow { color: #64748b; font-size: 12px; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 5px; }
+.title-row { display: flex; align-items: baseline; gap: 18px; }
+h1 { margin: 0; font-size: 28px; letter-spacing: -.02em; }
+h1 span { font-size: 14px; color: #94a3b8; font-weight: 600; margin-left: 4px; }
+.live-price { font-size: 18px; font-weight: 700; color: #cbd5e1; }
+.live-price.active::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #22c55e; margin-right: 7px; box-shadow: 0 0 0 4px rgba(34,197,94,.1); }
+.playback-controls { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; justify-content: flex-end; }
+.playback-controls label, .form-grid label { display: flex; flex-direction: column; gap: 5px; font-size: 11px; color: #94a3b8; }
+input, select { border: 1px solid #263449; background: #111c2e; color: #e5e7eb; border-radius: 7px; padding: 8px 9px; outline: none; min-height: 34px; }
+input:focus, select:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,.12); }
+button { border-radius: 7px; padding: 8px 14px; border: 1px solid #2b3a50; min-height: 34px; }
+button.secondary { background: #111c2e; color: #dbeafe; }
+button.primary, button.apply { background: #2563eb; border-color: #2563eb; color: #fff; font-weight: 700; }
+.error-banner { background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.35); color: #fecaca; padding: 10px 12px; border-radius: 8px; margin-bottom: 12px; }
+.stats-grid { display: grid; grid-template-columns: 1.25fr 1.1fr 1fr 1fr .9fr; border: 1px solid #1e2b3d; border-radius: 10px; overflow: hidden; background: #0f1929; }
+.stats-grid article { padding: 11px 14px; border-right: 1px solid #1e2b3d; min-width: 0; }
+.stats-grid article:last-child { border-right: 0; }
+.stats-grid span { display: block; color: #718096; font-size: 11px; margin-bottom: 4px; }
+.stats-grid strong { display: block; font-size: 16px; color: #f1f5f9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stats-grid small { display: block; color: #64748b; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.profit { color: #22c55e !important; }
+.loss { color: #ef4444 !important; }
+.progress { height: 2px; background: #111827; margin: 8px 0 12px; overflow: hidden; }
+.progress i { display: block; height: 100%; background: #3b82f6; transition: width .15s linear; }
+.workspace { display: grid; grid-template-columns: minmax(0, 1fr) 310px; gap: 12px; }
+.chart-panel, .settings-panel, .table-card { background: #0f1929; border: 1px solid #1e2b3d; border-radius: 10px; overflow: hidden; }
+.panel-head { min-height: 44px; padding: 9px 12px; border-bottom: 1px solid #1e2b3d; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.panel-head b { font-size: 13px; }
+.panel-head span { color: #64748b; font-size: 11px; margin-left: 9px; }
+.panel-head .buy-legend { color: #60a5fa; margin-left: 0; }
+.panel-head .sell-legend { color: #fbbf24; margin-left: 0; }
+.panel-head em { color: #93c5fd; font-style: normal; font-size: 12px; }
+.order-warning { margin: 10px 12px 0; padding: 9px 11px; border: 1px solid rgba(245,158,11,.35); background: rgba(245,158,11,.08); color: #fbbf24; border-radius: 7px; font-size: 11px; line-height: 1.5; }
+.order-warning b { color: #fde68a; }
+.chart { width: 100%; height: 520px; }
+.settings-panel { padding-bottom: 12px; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; padding: 12px; }
+.form-grid input { width: 100%; }
+.apply { width: calc(100% - 24px); margin: 0 12px 10px; }
+.logic-note { margin: 0 12px; padding: 9px 10px; border-radius: 7px; background: #111c2e; color: #7f8da3; font-size: 11px; line-height: 1.55; }
+.logic-note b { color: #cbd5e1; }
+.tables-grid { margin-top: 12px; display: grid; grid-template-columns: 1fr 1.3fr 1.15fr; gap: 12px; align-items: start; }
+.table-scroll { max-height: 305px; overflow: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 11px; }
+th { position: sticky; top: 0; z-index: 1; background: #111c2e; color: #718096; font-weight: 600; text-align: right; padding: 8px 10px; border-bottom: 1px solid #1e2b3d; }
+th:first-child, td:first-child { text-align: left; }
+td { color: #cbd5e1; text-align: right; padding: 7px 10px; border-bottom: 1px solid rgba(30,43,61,.7); white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+.empty { text-align: center !important; color: #526174; padding: 28px 10px; }
+.status { display: inline-block; font-size: 10px; padding: 2px 6px; border-radius: 999px; margin: 0; }
+.status.open { color: #fbbf24; background: rgba(245,158,11,.12); }
+.status.planned { color: #fde68a; background: rgba(245,158,11,.08); }
+.buy-order-price { color: #60a5fa; font-weight: 700; }
+.buy-order-row td:first-child { border-left: 2px solid rgba(59,130,246,.7); }
+.sell-order-price { color: #fbbf24; font-weight: 700; }
+.sell-order-row td:first-child { border-left: 2px solid rgba(245,158,11,.7); }
+.event-list { max-height: 305px; overflow: auto; }
+.event-row { display: grid; grid-template-columns: 38px 124px 1fr; gap: 8px; align-items: start; padding: 8px 10px; border-bottom: 1px solid rgba(30,43,61,.7); font-size: 11px; }
+.event-row > span { font-size: 9px; font-weight: 800; border-radius: 4px; text-align: center; padding: 2px 4px; }
+.event-row > span.buy { color: #60a5fa; background: rgba(59,130,246,.12); }
+.event-row > span.sell { color: #fbbf24; background: rgba(245,158,11,.12); }
+.event-row > span.system { color: #cbd5e1; background: rgba(148,163,184,.12); }
+.event-row time { color: #64748b; }
+.event-row p { margin: 0; color: #cbd5e1; line-height: 1.45; }
+@media (max-width: 1400px) {
+  .stats-grid { grid-template-columns: repeat(5, minmax(170px, 1fr)); }
+  .chart { height: 470px; }
+}

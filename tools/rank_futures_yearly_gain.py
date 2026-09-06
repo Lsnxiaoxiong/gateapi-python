@@ -46,6 +46,7 @@ from tools.market_candlesticks import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT,
     YEAR_SECONDS,
+    _call_with_retry,
     _decimal_to_text,
     _normalize_settle,
     get_one_year_hourly_candlesticks,
@@ -58,6 +59,7 @@ SOURCE_LATEST_CLOSE = "latest_candle_close"
 
 #: Default bounded concurrency for a full market scan.
 DEFAULT_MAX_WORKERS = 4
+CONTRACT_PAGE_SIZE = 100
 
 _DEFAULT_MARKET_CAP_PROVIDER = None
 
@@ -263,6 +265,80 @@ def _describe_error(exc):
     return "%s: %s" % (type(exc).__name__, exc)
 
 
+def _notify_stage(callback, phase, message, completed=0, total=0, **details):
+    """Emit a structured, optional progress event for long setup stages."""
+    if callback is None:
+        return
+    event = {
+        "phase": phase,
+        "message": message,
+        "completed": int(completed or 0),
+        "total": int(total or 0),
+    }
+    event.update(details)
+    callback(event)
+
+
+def _list_futures_contracts(api, settle, limit, request_timeout, max_retries,
+                            stage_callback=None):
+    """Fetch contracts in bounded pages for real Gate SDK clients.
+
+    Gate currently accepts at most 100 contracts per request even though this
+    generated SDK validates up to 1000. Injected test/custom APIs keep their
+    original one-call behaviour so dependency injection remains lightweight.
+    """
+    is_gate_sdk = callable(getattr(getattr(api, "api_client", None), "call_api", None))
+    common = {"_max_retries": max_retries}
+    if request_timeout is not None:
+        common["_request_timeout"] = request_timeout
+    if not is_gate_sdk:
+        page = list(_call_with_retry(api.list_futures_contracts, settle, **common) or [])
+        _notify_stage(
+            stage_callback, "contracts", "已获取 %d 个 Gate 合约" % len(page),
+            len(page), int(limit or len(page)), contracts_fetched=len(page), page=1,
+        )
+        return page
+
+    target = int(limit) if limit is not None and int(limit) > 0 else None
+    contracts = []
+    seen = set()
+    offset = 0
+    while target is None or len(contracts) < target:
+        remaining = target - len(contracts) if target is not None else CONTRACT_PAGE_SIZE
+        page_size = min(CONTRACT_PAGE_SIZE, remaining)
+        kwargs = dict(common)
+        kwargs.update({"limit": page_size, "offset": offset})
+        page = list(_call_with_retry(
+            api.list_futures_contracts, settle, **kwargs
+        ) or [])
+        if not page:
+            break
+        added = 0
+        for contract in page:
+            name = _contract_name(contract)
+            identity = name or id(contract)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            contracts.append(contract)
+            added += 1
+            if target is not None and len(contracts) >= target:
+                break
+        _notify_stage(
+            stage_callback, "contracts",
+            "Gate 合约列表：已获取 %d 个（第 %d 页）" %
+            (len(contracts), (offset // CONTRACT_PAGE_SIZE) + 1),
+            len(contracts), target or len(contracts),
+            contracts_fetched=len(contracts),
+            page=(offset // CONTRACT_PAGE_SIZE) + 1,
+            page_size=page_size,
+        )
+        if len(page) < page_size or added == 0:
+            break
+        offset += len(page)
+    return contracts
+
+
 def _rank_key(item):
     """Sort key: gain_pct descending, then contract name ascending."""
     gain = _parse_positive_decimal(item.get("gain_pct"))
@@ -271,7 +347,7 @@ def _rank_key(item):
 
 
 def _scan_one_contract(contract, settle, end_time, futures_api, request_timeout,
-                       max_retries, market_cap_usd=None):
+                       max_retries, market_cap_usd=None, stage_callback=None):
     """Fetch candles and build the result for one contract.
 
     Returns a ``(contract_name, result_dict_or_None, error_dict_or_None)``
@@ -280,6 +356,12 @@ def _scan_one_contract(contract, settle, end_time, futures_api, request_timeout,
     name = _contract_name(contract)
     if not name:
         return None, None, {"contract": None, "reason": "missing contract name"}
+    if stage_callback is not None:
+        stage_callback({
+            "phase": "scanning",
+            "message": "正在下载 %s 的近一年 1h K 线" % name,
+            "current_contract": name,
+        })
     try:
         candles = get_one_year_hourly_candlesticks(
             market_type="futures",
@@ -314,7 +396,8 @@ def rank_futures_by_yearly_low_gain(settle="usdt", end_time=None,
                                     progress_callback=None, limit=None,
                                     min_market_cap_musd=None, max_market_cap_musd=None,
                                     min_order_value=None, max_order_value=None,
-                                    market_cap_provider=None, result_callback=None):
+                                    market_cap_provider=None, result_callback=None,
+                                    stage_callback=None):
     # noqa: E501 - long signature kept for explicit dependency injection
     """Rank active perpetual contracts by yearly low-to-current gain.
 
@@ -366,7 +449,17 @@ def rank_futures_by_yearly_low_gain(settle="usdt", end_time=None,
     try:
         if futures_api is None:
             futures_api = _default_futures_api(request_timeout)
-        contracts = futures_api.list_futures_contracts(settle)
+        _notify_stage(
+            stage_callback, "contracts", "正在获取 Gate 合约列表", 0,
+            int(limit or 0), contracts_fetched=0, page=0,
+        )
+        # The contract list is the first potentially slow operation. Paginate
+        # it and apply the preview limit at the API boundary so the UI does not
+        # download every Gate contract before it can show progress.
+        contracts = _list_futures_contracts(
+            futures_api, settle, limit, request_timeout, max_retries,
+            stage_callback=stage_callback,
+        )
     except Exception:
         # The contract-list request failing is fatal; do not fake completeness.
         if owns_client and futures_api is not None:
@@ -375,6 +468,17 @@ def rank_futures_by_yearly_low_gain(settle="usdt", end_time=None,
 
     active = [c for c in (contracts or []) if _is_active_contract(c) and _contract_name(c)]
     total_contracts = len(active)
+    # ``limit`` is an interactive preview limit, so apply it before expensive
+    # market-cap lookup. The previous order queried market caps for every Gate
+    # contract even when the UI requested only 10/50/400 candidates, leaving
+    # refresh stuck at 0% while external market-data pages were exhausted.
+    if limit is not None and limit > 0:
+        active = sorted(
+            active,
+            key=lambda c: _parse_positive_decimal(getattr(c, "trade_size", None)) or Decimal(0),
+            reverse=True,
+        )[:int(limit)]
+    candidate_contracts = len(active)
     cap_filter_enabled = min_cap_m is not None or max_cap_m is not None
     order_filter_enabled = min_order is not None or max_order is not None
     caps_by_contract = {}
@@ -383,13 +487,29 @@ def rank_futures_by_yearly_low_gain(settle="usdt", end_time=None,
         if market_cap_provider is None:
             market_cap_provider = _get_default_market_cap_provider()
         symbols = {_base_currency(contract) for contract in active}
+        _notify_stage(
+            stage_callback, "market_caps",
+            "正在查询 %d 个币种的市值" % len(symbols), 0, len(symbols),
+            symbols_requested=len(symbols), symbols_matched=0,
+        )
         if uses_default_market_caps:
+            def _market_cap_progress(event):
+                _notify_stage(
+                    stage_callback, "market_caps", event.get("message") or "正在查询市值",
+                    event.get("completed", 0), event.get("total", 0),
+                    provider=event.get("provider"),
+                    provider_step=event.get("step"),
+                    symbols_requested=event.get("requested", len(symbols)),
+                    symbols_matched=event.get("matched", 0),
+                )
+
             caps = market_cap_provider.get_many(
                 symbols,
                 min_market_cap_usd=(min_cap_m * Decimal(1000000)
                                     if min_cap_m is not None else None),
                 max_market_cap_usd=(max_cap_m * Decimal(1000000)
                                     if max_cap_m is not None else None),
+                progress_callback=_market_cap_progress,
             )
         else:
             caps = market_cap_provider.get_many(symbols)
@@ -397,7 +517,17 @@ def rank_futures_by_yearly_low_gain(settle="usdt", end_time=None,
             _contract_name(contract): _parse_positive_decimal(caps.get(_base_currency(contract)))
             for contract in active
         }
+        _notify_stage(
+            stage_callback, "market_caps",
+            "市值查询完成：匹配 %d/%d 个币种" % (len(caps), len(symbols)),
+            len(caps), len(symbols), symbols_requested=len(symbols),
+            symbols_matched=len(caps),
+        )
 
+    _notify_stage(
+        stage_callback, "filtering", "正在应用市值和最小下单价值筛选",
+        0, candidate_contracts, candidate_contracts=candidate_contracts,
+    )
     eligible = []
     for contract in active:
         cap_usd = caps_by_contract.get(_contract_name(contract))
@@ -410,14 +540,21 @@ def rank_futures_by_yearly_low_gain(settle="usdt", end_time=None,
         eligible.append(contract)
     active = eligible
     eligible_contracts = len(active)
-    if limit is not None and limit > 0:
-        # Pick the most actively traded contracts for a fast interactive preview.
-        active = sorted(
-            active,
-            key=lambda c: _parse_positive_decimal(getattr(c, "trade_size", None)) or Decimal(0),
-            reverse=True,
-        )[:int(limit)]
     total = len(active)
+    _notify_stage(
+        stage_callback, "filtering",
+        "筛选完成：%d/%d 个合约进入 K 线扫描" %
+        (eligible_contracts, candidate_contracts),
+        candidate_contracts, candidate_contracts,
+        candidate_contracts=candidate_contracts,
+        eligible_contracts=eligible_contracts,
+    )
+    _notify_stage(
+        stage_callback, "scanning",
+        "开始下载近一年 1h K 线", 0, total,
+        candidate_contracts=candidate_contracts,
+        eligible_contracts=eligible_contracts,
+    )
     results = []
     errors = []
 
@@ -427,7 +564,7 @@ def rank_futures_by_yearly_low_gain(settle="usdt", end_time=None,
         for contract in active:
             name, result, error = _scan_one_contract(
                 contract, settle, end_time, futures_api, request_timeout, max_retries,
-                caps_by_contract.get(_contract_name(contract)))
+                caps_by_contract.get(_contract_name(contract)), stage_callback)
             if result is not None:
                 results.append(result)
                 if result_callback is not None:
@@ -443,7 +580,8 @@ def rank_futures_by_yearly_low_gain(settle="usdt", end_time=None,
             future_map = {
                 pool.submit(_scan_one_contract, contract, settle, end_time,
                             futures_api, request_timeout, max_retries,
-                            caps_by_contract.get(_contract_name(contract))): contract
+                            caps_by_contract.get(_contract_name(contract)),
+                            stage_callback): contract
                 for contract in active
             }
             for future in as_completed(future_map):
@@ -467,6 +605,7 @@ def rank_futures_by_yearly_low_gain(settle="usdt", end_time=None,
         "errors": errors,
         "stats": {
             "total_contracts": total_contracts,
+            "candidate_contracts": candidate_contracts,
             "eligible_contracts": eligible_contracts,
             "requested_contracts": len(active),
             "successful_contracts": len(results),

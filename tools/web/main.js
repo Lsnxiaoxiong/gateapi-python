@@ -218,7 +218,9 @@ const RankView = {
     const maxOrderValue = ref('');
     const progress = ref({
       completed: 0, total: 0, successful: 0, failed: 0,
-      percent: 0, current_contract: null, phase: 'idle',
+      percent: 0, current_contract: null, phase: 'idle', message: '',
+      stage_completed: 0, stage_total: 0, stage_percent: 0,
+      elapsed_seconds: 0, details: {},
     });
     let loadToken = 0;
 
@@ -232,7 +234,10 @@ const RankView = {
       partialResults.value = [];
       progress.value = {
         completed: 0, total: Number(scanLimit.value) || 0,
-        successful: 0, failed: 0, percent: 0, current_contract: null, phase: 'preparing',
+        successful: 0, failed: 0, percent: 0, current_contract: null,
+        phase: 'queued', message: '正在创建扫描任务',
+        stage_completed: 0, stage_total: Number(scanLimit.value) || 0,
+        stage_percent: 0, elapsed_seconds: 0, details: {},
       };
       try {
         const limit = Math.max(1, Math.floor(Number(scanLimit.value) || 50));
@@ -297,6 +302,18 @@ const RankView = {
       return rows;
     });
 
+    const phaseOrder = ['queued', 'contracts', 'market_caps', 'filtering', 'scanning', 'completed'];
+    const phaseLabels = {
+      queued: '准备任务', contracts: '获取合约', market_caps: '查询市值',
+      filtering: '筛选合约', scanning: '下载 K 线', completed: '完成', failed: '失败',
+    };
+    const phaseIndex = computed(() => Math.max(0, phaseOrder.indexOf(progress.value.phase)));
+    const phaseLabel = computed(() => phaseLabels[progress.value.phase] || '处理中');
+    const stageCompleted = computed(() => Number(progress.value.stage_completed || 0));
+    const stageTotal = computed(() => Number(progress.value.stage_total || 0));
+    const stagePercent = computed(() => Number(progress.value.stage_percent || 0));
+    const progressDetails = computed(() => progress.value.details || {});
+
     function addPair(contract) {
       console.log('[RankView] addPair', contract);
       emit('add-pair', contract);
@@ -320,7 +337,9 @@ const RankView = {
 
     return { loading, error, report, filter, scanLimit,
              minMarketCap, maxMarketCap, minOrderValue, maxOrderValue,
-             progress, partialResults, filtered, load, addPair, fmt, fmtCap };
+             progress, partialResults, filtered, load, addPair, fmt, fmtCap,
+             phaseOrder, phaseLabels, phaseIndex, phaseLabel,
+             stageCompleted, stageTotal, stagePercent, progressDetails };
   },
   template: `
     <div>
@@ -354,21 +373,44 @@ const RankView = {
       </div>
       <div class="card-error" v-if="error" style="margin:10px 14px">{{ error }}</div>
       <div v-if="loading" class="rank-loading">
+        <div class="rank-stage-steps" aria-label="扫描阶段">
+          <span v-for="(phase, index) in phaseOrder.slice(1, 5)" :key="phase"
+                :class="{ active: progress.phase === phase, done: phaseIndex > index + 1 }">
+            <i>{{ phaseIndex > index + 1 ? '✓' : index + 1 }}</i>{{ phaseLabels[phase] }}
+          </span>
+        </div>
         <div class="rank-progress-head">
-          <span><span class="spinner"></span> 正在扫描活跃合约</span>
-          <b>{{ progress.completed }} / {{ progress.total || scanLimit }}</b>
+          <span><span class="spinner"></span> {{ phaseLabel }}</span>
+          <b v-if="stageTotal">{{ stageCompleted }} / {{ stageTotal }}</b>
+          <b v-else>处理中</b>
         </div>
         <div class="rank-progress-track" role="progressbar"
-             :aria-valuenow="progress.percent" aria-valuemin="0" aria-valuemax="100">
-          <div class="rank-progress-bar" :style="{ width: Math.max(0, Math.min(100, progress.percent || 0)) + '%' }"></div>
+             :aria-valuenow="stagePercent" aria-valuemin="0" aria-valuemax="100">
+          <div class="rank-progress-bar" :style="{ width: Math.max(0, Math.min(100, stagePercent)) + '%' }"></div>
         </div>
         <div class="rank-progress-meta">
-          <span>{{ (progress.percent || 0).toFixed(1) }}%</span>
-          <span>成功 {{ progress.successful || 0 }}</span>
-          <span>失败 {{ progress.failed || 0 }}</span>
-          <span v-if="progress.current_contract">
-            {{ progress.phase === 'filtering' ? progress.current_contract : '当前 ' + progress.current_contract }}
+          <span>阶段 {{ stagePercent.toFixed(1) }}%</span>
+          <span>总耗时 {{ Number(progress.elapsed_seconds || 0).toFixed(1) }}s</span>
+          <span v-if="progress.phase === 'scanning'">成功 {{ progress.successful || 0 }}</span>
+          <span v-if="progress.phase === 'scanning'">失败 {{ progress.failed || 0 }}</span>
+        </div>
+        <div class="rank-progress-detail">
+          <b>{{ progress.message || '正在处理…' }}</b>
+          <span v-if="progressDetails.contracts_fetched !== undefined">
+            已获取合约 {{ progressDetails.contracts_fetched }}
+            <template v-if="progressDetails.page"> · 第 {{ progressDetails.page }} 页</template>
           </span>
+          <span v-if="progress.phase === 'market_caps'">
+            数据源 {{ progressDetails.provider || '准备中' }}
+            · 已匹配 {{ progressDetails.symbols_matched || 0 }}/{{ progressDetails.symbols_requested || scanLimit }} 个币种
+          </span>
+          <span v-if="progressDetails.candidate_contracts !== undefined">
+            候选 {{ progressDetails.candidate_contracts }}
+            <template v-if="progressDetails.eligible_contracts !== undefined">
+              · 筛选通过 {{ progressDetails.eligible_contracts }}
+            </template>
+          </span>
+          <span v-if="progress.current_contract">当前交易对 {{ progress.current_contract }}</span>
         </div>
       </div>
       <div class="rank-wrap" v-if="filtered.length">

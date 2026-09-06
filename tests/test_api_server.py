@@ -181,8 +181,17 @@ class _ApiServerTests(unittest.TestCase):
     def test_rank_job_reports_progress_and_result(self):
         def fake_rank(settle="usdt", end_time=None, futures_api=None,
                       max_workers=4, progress_callback=None, limit=None,
-                      result_callback=None):
+                      result_callback=None, stage_callback=None):
             total = int(limit or 3)
+            if stage_callback is not None:
+                stage_callback({
+                    "phase": "contracts", "message": "已获取合约 3/3",
+                    "completed": 3, "total": 3, "contracts_fetched": 3,
+                })
+                stage_callback({
+                    "phase": "scanning", "message": "开始下载 K 线",
+                    "completed": 0, "total": total, "eligible_contracts": total,
+                })
             for i in range(total):
                 if progress_callback is not None:
                     progress_callback(i + 1, total, "C%d_USDT" % (i + 1), None)
@@ -225,6 +234,9 @@ class _ApiServerTests(unittest.TestCase):
         self.assertEqual(job["progress"]["completed"], 3)
         self.assertEqual(job["progress"]["percent"], 100.0)
         self.assertEqual(job["progress"]["successful"], 3)
+        self.assertEqual(job["progress"]["stage_percent"], 100.0)
+        self.assertEqual(job["progress"]["message"], "扫描完成")
+        self.assertEqual(job["progress"]["details"]["contracts_fetched"], 3)
         self.assertEqual(job["report"]["results"][0]["contract"], "BTC_USDT")
         self.assertEqual(job["partial_results"][0]["contract"], "BTC_USDT")
 
@@ -249,7 +261,7 @@ class _ApiServerTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertIn(b"<div id=\"app\">", r.content)
         self.assertIn(b"/static/main.js", r.content)
-        self.assertIn(b"main.js?v=20260824-2", r.content)
+        self.assertIn(b"main.js?v=20260830-1", r.content)
         self.assertEqual(r.headers["cache-control"], "no-cache, no-store, must-revalidate")
 
     def test_static_main_js_served(self):

@@ -51,8 +51,10 @@ class StubCandlesApi(object):
         self.candle_responses = candle_responses or {}
         self.contracts_error = contracts_error
         self.candle_calls = []
+        self.contract_list_kwargs = None
 
-    def list_futures_contracts(self, settle):
+    def list_futures_contracts(self, settle, **kwargs):
+        self.contract_list_kwargs = kwargs
         if self.contracts_error:
             raise RuntimeError("contract list unavailable")
         return list(self.contracts)
@@ -67,6 +69,37 @@ def make_futures_candle(ts, low="1", high="2", open_p="1", close="1.5", v="10"):
 
 
 class _ContractFilterTests(unittest.TestCase):
+
+    def test_contract_list_request_uses_bounded_timeout(self):
+        api = StubCandlesApi([])
+        rg.rank_futures_by_yearly_low_gain(
+            futures_api=api, max_workers=1, request_timeout=12, max_retries=0)
+        self.assertEqual(api.contract_list_kwargs["_request_timeout"], 12)
+
+    def test_real_sdk_style_contract_list_is_paginated_by_100(self):
+        class PagedApi(object):
+            def __init__(self):
+                self.api_client = SimpleNamespace(call_api=lambda: None)
+                self.contracts = [
+                    contract("C%03d_USDT" % i, last_price="2")
+                    for i in range(350)
+                ]
+                self.calls = []
+
+            def list_futures_contracts(self, settle, **kwargs):
+                self.calls.append(kwargs.copy())
+                offset = kwargs["offset"]
+                return self.contracts[offset:offset + kwargs["limit"]]
+
+        api = PagedApi()
+        rows = rg._list_futures_contracts(
+            api, "usdt", 250, request_timeout=9, max_retries=0)
+        self.assertEqual(len(rows), 250)
+        self.assertEqual(
+            [(call["offset"], call["limit"]) for call in api.calls],
+            [(0, 100), (100, 100), (200, 50)],
+        )
+        self.assertTrue(all(call["_request_timeout"] == 9 for call in api.calls))
 
     def test_only_active_trading_non_delisting_contracts_scanned(self):
         api = StubCandlesApi([
@@ -213,6 +246,29 @@ class _RangeFilterTests(unittest.TestCase):
                 futures_api=api, min_market_cap_musd=20, max_market_cap_musd=10)
         self.assertEqual(self.calls, [])
 
+    def test_preview_limit_is_applied_before_market_cap_lookup(self):
+        requested_symbols = []
+
+        class Caps(object):
+            def get_many(self, symbols):
+                requested_symbols.extend(sorted(symbols))
+                return {symbol: 12000000 for symbol in symbols}
+
+        api = StubCandlesApi([
+            contract("LOW_USDT", last_price="2", trade_size="1"),
+            contract("MID_USDT", last_price="2", trade_size="20"),
+            contract("HIGH_USDT", last_price="2", trade_size="100"),
+        ])
+        report = rg.rank_futures_by_yearly_low_gain(
+            futures_api=api, max_workers=1, limit=2,
+            max_market_cap_musd=50, market_cap_provider=Caps())
+
+        self.assertEqual(requested_symbols, ["high", "mid"])
+        self.assertEqual(self.calls, ["HIGH_USDT", "MID_USDT"])
+        self.assertEqual(report["stats"]["total_contracts"], 3)
+        self.assertEqual(report["stats"]["candidate_contracts"], 2)
+        self.assertEqual(report["stats"]["requested_contracts"], 2)
+
 
 class _SortingTests(unittest.TestCase):
 
@@ -316,6 +372,25 @@ class _ErrorIsolationTests(unittest.TestCase):
 
 
 class _ConcurrencyAndCallbackTests(unittest.TestCase):
+
+    def test_stage_callback_reports_setup_and_scan_phases(self):
+        api = StubCandlesApi([contract("AAA_USDT", last_price="2")])
+        original = rg.get_one_year_hourly_candlesticks
+        rg.get_one_year_hourly_candlesticks = lambda *a, **k: [candle(100, "1", "1.5")]
+        events = []
+        try:
+            rg.rank_futures_by_yearly_low_gain(
+                futures_api=api, max_workers=1, stage_callback=events.append)
+        finally:
+            rg.get_one_year_hourly_candlesticks = original
+        phases = [event["phase"] for event in events]
+        self.assertIn("contracts", phases)
+        self.assertIn("filtering", phases)
+        self.assertIn("scanning", phases)
+        scan_start = next(event for event in events
+                          if event["phase"] == "scanning" and "total" in event)
+        self.assertEqual(scan_start["total"], 1)
+        self.assertEqual(events[-1]["current_contract"], "AAA_USDT")
 
     def test_progress_callback_invoked_once_per_contract(self):
         api = StubCandlesApi([

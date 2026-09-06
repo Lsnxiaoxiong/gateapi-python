@@ -58,19 +58,34 @@ class CoinGeckoMarketCaps(object):
             ids.update(self._coins_by_symbol.get(symbol, []))
         return sorted(ids)
 
-    def get_many(self, symbols, **_range):
+    def get_many(self, symbols, progress_callback=None, **_range):
         """Return ``{lowercase_ticker: market_cap_usd}`` for known tickers."""
         symbols = set(str(symbol).lower() for symbol in symbols if symbol)
         missing = sorted(symbol for symbol in symbols if symbol not in self._cache)
         ids = self._coin_ids(missing)
+        if progress_callback is not None:
+            progress_callback({
+                "provider": "CoinGecko", "step": "coin_list",
+                "completed": 1, "total": max(1, 1 + ((len(ids) + 249) // 250)),
+                "matched": 0, "requested": len(symbols),
+                "message": "CoinGecko 币种映射已加载",
+            })
         markets = []
-        for start in range(0, len(ids), 250):
+        batches = list(range(0, len(ids), 250))
+        for batch_index, start in enumerate(batches, 1):
             markets.extend(self._get_json("/coins/markets", {
                 "vs_currency": "usd",
                 "ids": ",".join(ids[start:start + 250]),
                 "per_page": 250,
                 "page": 1,
             }))
+            if progress_callback is not None:
+                progress_callback({
+                    "provider": "CoinGecko", "step": "market_batch",
+                    "completed": 1 + batch_index, "total": 1 + len(batches),
+                    "matched": len(markets), "requested": len(symbols),
+                    "message": "CoinGecko 市值批次 %d/%d" % (batch_index, len(batches)),
+                })
         by_symbol = {}
         for market in markets:
             symbol = str(market.get("symbol") or "").lower()
@@ -90,7 +105,7 @@ class CoinPaprikaMarketCaps(object):
         self.http = http or _default_http()
         self._caps = None
 
-    def get_many(self, symbols, **_range):
+    def get_many(self, symbols, progress_callback=None, **_range):
         symbols = set(str(symbol).lower() for symbol in symbols if symbol)
         if self._caps is None:
             response = self.http.request(
@@ -109,6 +124,14 @@ class CoinPaprikaMarketCaps(object):
                 if symbol and cap is not None and (symbol not in caps or cap > caps[symbol]):
                     caps[symbol] = cap
             self._caps = caps
+            if progress_callback is not None:
+                progress_callback({
+                    "provider": "CoinPaprika", "step": "tickers",
+                    "completed": 1, "total": 1,
+                    "matched": len(symbols.intersection(self._caps)),
+                    "requested": len(symbols),
+                    "message": "CoinPaprika 全量市值已加载",
+                })
         return {symbol: self._caps[symbol] for symbol in symbols if symbol in self._caps}
 
 
@@ -116,11 +139,14 @@ class CoinLoreMarketCaps(object):
     """Resolve tickers from direct, market-cap-sorted CoinLore pages."""
 
     PAGE_SIZE = 100
+    DEFAULT_MAX_PAGES = 10
 
-    def __init__(self, http=None):
+    def __init__(self, http=None, max_pages=DEFAULT_MAX_PAGES):
         self.http = http or _default_http()
+        self.max_pages = max(1, int(max_pages))
         self._caps = {}
         self._next_start = 0
+        self._pages_loaded = 0
         self._lowest_loaded_cap = None
         self._exhausted = False
         self._lock = threading.RLock()
@@ -154,23 +180,34 @@ class CoinLoreMarketCaps(object):
             if symbol not in self._caps or cap > self._caps[symbol]:
                 self._caps[symbol] = cap
         self._next_start += len(rows)
+        self._pages_loaded += 1
         if page_caps:
             self._lowest_loaded_cap = min(page_caps)
         total = int((payload.get("info") or {}).get("coins_num") or 0)
         if len(rows) < self.PAGE_SIZE or (total and self._next_start >= total):
             self._exhausted = True
 
-    def get_many(self, symbols, min_market_cap_usd=None, **_range):
+    def get_many(self, symbols, min_market_cap_usd=None,
+                 progress_callback=None, **_range):
         symbols = set(str(symbol).lower() for symbol in symbols if symbol)
         minimum = float(min_market_cap_usd) if min_market_cap_usd is not None else None
         with self._lock:
-            while not self._exhausted:
+            while not self._exhausted and self._pages_loaded < self.max_pages:
                 all_found = all(symbol in self._caps for symbol in symbols)
                 below_minimum = (minimum is not None and self._lowest_loaded_cap is not None
                                  and self._lowest_loaded_cap < minimum)
                 if all_found or below_minimum:
                     break
                 self._load_page()
+                if progress_callback is not None:
+                    progress_callback({
+                        "provider": "CoinLore", "step": "page",
+                        "completed": self._pages_loaded, "total": self.max_pages,
+                        "matched": len(symbols.intersection(self._caps)),
+                        "requested": len(symbols),
+                        "message": "CoinLore 市值第 %d/%d 页" %
+                                   (self._pages_loaded, self.max_pages),
+                    })
             return {symbol: self._caps[symbol] for symbol in symbols if symbol in self._caps}
 
 
@@ -179,16 +216,37 @@ class DefaultMarketCaps(object):
 
     def __init__(self, providers=None):
         self.providers = providers or [
-            CoinLoreMarketCaps(), CoinPaprikaMarketCaps(), CoinGeckoMarketCaps(),
+            # CoinLore is reachable reliably from the target runtime and is
+            # bounded by ``DEFAULT_MAX_PAGES``. CoinGecko/Paprika remain
+            # fallbacks when CoinLore returns no matching symbols.
+            CoinLoreMarketCaps(), CoinGeckoMarketCaps(), CoinPaprikaMarketCaps(),
         ]
 
-    def get_many(self, symbols, **market_cap_range):
+    def get_many(self, symbols, progress_callback=None, **market_cap_range):
         symbols = set(str(symbol).lower() for symbol in symbols if symbol)
         errors = []
-        for provider in self.providers:
+        for provider_index, provider in enumerate(self.providers, 1):
+            provider_name = type(provider).__name__.replace("MarketCaps", "")
             try:
-                result = provider.get_many(symbols, **market_cap_range)
+                if progress_callback is not None:
+                    progress_callback({
+                        "provider": provider_name, "step": "provider",
+                        "completed": provider_index - 1, "total": len(self.providers),
+                        "matched": 0, "requested": len(symbols),
+                        "message": "正在连接市值数据源 %s" % provider_name,
+                    })
+                result = provider.get_many(
+                    symbols, progress_callback=progress_callback, **market_cap_range
+                )
                 if result or not symbols:
+                    if progress_callback is not None:
+                        progress_callback({
+                            "provider": provider_name, "step": "completed",
+                            "completed": provider_index, "total": len(self.providers),
+                            "matched": len(result), "requested": len(symbols),
+                            "message": "%s 已匹配 %d/%d 个币种" %
+                                       (provider_name, len(result), len(symbols)),
+                        })
                     return result
                 errors.append("%s returned no data" % type(provider).__name__)
             except Exception as exc:  # noqa: BLE001 - fallback is intentional

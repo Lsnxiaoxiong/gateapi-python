@@ -736,6 +736,8 @@ class ShortOrderListener:
 
     def _event_from_order(self, order) -> dict:
         return {
+            "_rest_snapshot": True,
+            "finish_as": str(getattr(order, "finish_as", "") or ""),
             "id": str(order.id),
             "text": str(getattr(order, "text", "") or ""),
             "currency_pair": str(
@@ -801,6 +803,12 @@ class ShortOrderListener:
         account = str(event.get("account", "") or "")
         if account and account != self.account_name:
             return False
+        # 旧整数推送可能把 ±0.1 张变为 0，连方向也无法确定；只能等待 REST。
+        if "amount" in event and Decimal(str(event.get("amount") or "0")) <= 0:
+            core.flag_open_verification(
+                self.store, self.pair, self.code, str(event.get("id", ""))
+            )
+            return False
         side = str(event.get("side", ""))
         if side not in {"buy", "sell"}:
             return False
@@ -827,7 +835,7 @@ class ShortOrderListener:
         if side == "sell":
             # 开空 leg 成交
             was_filled = row["buy_status"] == core.BUY_FILLED
-            updated = core.mark_buy_result(self.store, row, result)
+            updated = core.apply_buy_update(self.api, self.store, self.pair, row, result)
             if (
                 not was_filled
                 and updated is not None
@@ -983,6 +991,7 @@ class ShortOrderListener:
             try:
                 ws = websocket.create_connection(
                     self.ws_url,
+                    header={"X-Gate-Size-Decimal": "1"},
                     timeout=core.NETWORK_TIMEOUT[1],
                     **self._proxy_options(),
                 )
