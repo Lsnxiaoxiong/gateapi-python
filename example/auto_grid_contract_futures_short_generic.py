@@ -1231,7 +1231,7 @@ def run_short_grid(
         print(
             f"[{core.now_text()}] 当前参数生成策略码={generated_code}，"
             f"数据库已有策略码={code}；resume 模式按数据库策略继续运行，"
-            "不再严格校对启动参数"
+            f"已有订单数量保持不变，新单每格保证金={margin}，杠杆={leverage_value}"
         )
     price_state = core.PriceState(current)
     stop = threading.Event()
@@ -1345,9 +1345,10 @@ def run_short_grid(
         shutdown_timeout = (
             core.NETWORK_RETRY_ATTEMPTS * core.NETWORK_TIMEOUT[1] + 5
         )
-        checker.join(timeout=shutdown_timeout)
-        listener.join(timeout=shutdown_timeout)
-        state_sync.join(timeout=shutdown_timeout)
+        # 初始化失败或只有部分线程启动时，逐个检查，避免清理异常覆盖原异常。
+        for worker in (checker, listener, state_sync):
+            if worker.is_alive():
+                worker.join(timeout=shutdown_timeout)
         if checker.is_alive() or listener.is_alive() or state_sync.is_alive():
             print(
                 f"[{core.now_text()}] 做空异步线程仍在退出中，"

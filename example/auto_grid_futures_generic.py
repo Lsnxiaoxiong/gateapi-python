@@ -1002,6 +1002,19 @@ class GridStore:
         self.execute("DELETE FROM grid_cycles WHERE currency_pair=?", (pair,))
 
 
+def resume_strategy_code(store: GridStore, pair: str) -> Optional[str]:
+    """恢复唯一活动策略的订单标签；改金额不重写历史订单或数量。"""
+    rows = store.rows(
+        "SELECT strategy_code,COUNT(*) AS n FROM grid_cycles "
+        "WHERE currency_pair=? AND completed=0 GROUP BY strategy_code",
+        (pair,),
+    )
+    if len(rows) > 1:
+        details = ", ".join(f"{r['strategy_code']}({r['n']}条)" for r in rows)
+        raise RuntimeError(f"{pair} 存在多个未完成策略，无法自动选择：{details}")
+    return str(rows[0]["strategy_code"]) if rows else None
+
+
 class PriceState:
     def __init__(self, value: Decimal):
         self.lock = threading.Lock()
@@ -2594,6 +2607,18 @@ def run_grid(
         pair, reference, step_pct, tp_pct, margin, leverage_value, grid_tag,
         max_unclosed_per_grid, account_mode,
     )
+    try:
+        existing_code = resume_strategy_code(store, pair) if startup_mode == "resume" else None
+        if existing_code:
+            code = existing_code
+            print(f"[{now_text()}] 恢复策略={code}；已有订单数量保持不变，"
+                  f"新单每格金额={margin}，杠杆={leverage_value}")
+    except Exception:
+        store.close()
+        process_lock.release()
+        for client in (state_client, listener_client, checker_client, main_client):
+            client.close()
+        raise
     price_state = PriceState(current)
 
     stop = threading.Event()
@@ -2798,9 +2823,9 @@ def run_grid(
                       for attempt in range(NETWORK_RETRY_ATTEMPTS - 1))
                 + 2
             )
-            checker.join(timeout=shutdown_timeout)
-            listener.join(timeout=shutdown_timeout)
-            state_sync.join(timeout=shutdown_timeout)
+            for worker in (checker, listener, state_sync):
+                if worker.is_alive():
+                    worker.join(timeout=shutdown_timeout)
         if checker.is_alive() or listener.is_alive() or state_sync.is_alive():
             print(f"[{now_text()}] 异步线程仍在退出中，暂不关闭其客户端")
         else:
