@@ -35,5 +35,5 @@ sudo journalctl -u gate-grid-hemi -f
 sudo journalctl -u gate-grid-soxl -f
 sudo journalctl -u gate-grid-btc -f
 sudo journalctl -u gate-grid-eth -f
-sudo journalctl -u gate-grid-eth5l -f
+sudo journalctl -u gate-grid-contract-eth.service -f
 sudo journalctl -u gate-grid-hype -f

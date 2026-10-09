@@ -14,7 +14,7 @@ def main() -> int:
         csv=CSV,
         timezone="UTC",
         reference_price=0,
-        margin_per_grid=20,
+        margin_per_grid=40,
         leverage=1,
         grid_step_pct=1,
         take_profit_pct=1,
