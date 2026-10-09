@@ -714,6 +714,7 @@ def run_grid(
         )
         cycle = 0
         failures = 0
+        balance_cooldown_until = 0.0
         while not stop.is_set() and (max_cycles is None or cycle < max_cycles):
             cycle += 1
             try:
@@ -723,11 +724,21 @@ def run_grid(
                     reference, current, step_pct, buy_grid_count, margin,
                     leverage_value, contract_spec,
                 )
-                core.place_missing_buys(
-                    apis[0], store, contract, code, desired, tp_pct,
-                    contract_spec.grid_spec, False, buy_client_order_prefix,
-                    max_unclosed_per_grid,
-                )
+                # 资金不足只延后新增开仓；行情、状态同步和止盈线程继续运行。
+                if time.monotonic() >= balance_cooldown_until:
+                    funded = core.place_missing_buys(
+                        apis[0], store, contract, code, desired, tp_pct,
+                        contract_spec.grid_spec, False, buy_client_order_prefix,
+                        max_unclosed_per_grid,
+                    )
+                    if not funded:
+                        balance_cooldown_until = (
+                            time.monotonic() + core.BALANCE_RETRY_INTERVAL
+                        )
+                        print(
+                            f"[{core.now_text()}] 可用保证金不足，继续维护现有订单，"
+                            f"{core.BALANCE_RETRY_INTERVAL} 秒后重试开仓补单"
+                        )
                 upper = core.take_profit_window_upper(
                     reference, current, step_pct, take_profit_grid_count,
                     contract_spec.grid_spec,

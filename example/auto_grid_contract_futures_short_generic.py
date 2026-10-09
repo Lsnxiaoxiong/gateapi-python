@@ -382,7 +382,7 @@ def place_missing_shorts(
                 )
             else:
                 store.release_buy_reservation(reservation_id)
-            if exc.label in {"BALANCE_NOT_ENOUGH", "AUTO_BORROW_TOO_MUCH"}:
+            if exc.label in core.FUNDING_ERROR_LABELS:
                 print(f"[{core.now_text()}] 开空保证金不足，暂停本轮补单")
                 return False
             raise
@@ -1288,6 +1288,7 @@ def run_short_grid(
         )
         cycle = 0
         failures = 0
+        balance_cooldown_until = 0.0
         while not stop.is_set() and (max_cycles is None or cycle < max_cycles):
             cycle += 1
             try:
@@ -1297,11 +1298,21 @@ def run_short_grid(
                     reference, current, step_pct, short_grid_count, margin,
                     leverage_value, contract_spec,
                 )
-                place_missing_shorts(
-                    apis[0], store, contract, code, desired, tp_pct,
-                    contract_spec.grid_spec, open_client_order_prefix,
-                    max_unclosed_per_grid,
-                )
+                # 资金不足只延后新增开仓，不阻塞同步和已有仓位的平仓维护。
+                if time.monotonic() >= balance_cooldown_until:
+                    funded = place_missing_shorts(
+                        apis[0], store, contract, code, desired, tp_pct,
+                        contract_spec.grid_spec, open_client_order_prefix,
+                        max_unclosed_per_grid,
+                    )
+                    if not funded:
+                        balance_cooldown_until = (
+                            time.monotonic() + core.BALANCE_RETRY_INTERVAL
+                        )
+                        print(
+                            f"[{core.now_text()}] 可用保证金不足，继续维护现有订单，"
+                            f"{core.BALANCE_RETRY_INTERVAL} 秒后重试开仓补单"
+                        )
                 lower = short_take_profit_window_lower(
                     reference, current, step_pct, take_profit_grid_count,
                     contract_spec.grid_spec,

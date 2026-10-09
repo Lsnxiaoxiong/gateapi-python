@@ -48,6 +48,9 @@ LIVE_CONFIRM_TEXT = "RUN_REAL_MARGIN_DB_GRID"
 NETWORK_TIMEOUT = (5, 10)
 NETWORK_RETRY_ATTEMPTS = 3
 BALANCE_RETRY_INTERVAL = 30
+FUNDING_ERROR_LABELS = frozenset({
+    "BALANCE_NOT_ENOUGH", "AUTO_BORROW_TOO_MUCH", "INSUFFICIENT_AVAILABLE",
+})
 CHECK_BATCH_INTERVAL = 0.5
 GRID_CHECK_INTERVAL = 1.0
 ORDER_STATE_CHECK_INTERVAL = 1.0
@@ -2038,7 +2041,7 @@ def place_missing_buys(
                 )
             else:
                 store.release_buy_reservation(reservation_id)
-            if exc.label in {"BALANCE_NOT_ENOUGH", "AUTO_BORROW_TOO_MUCH"}:
+            if exc.label in FUNDING_ERROR_LABELS:
                 print(f"[{now_text()}] 买单资金/可借额度不足，暂停本轮补单")
                 return False
             raise
@@ -2094,7 +2097,7 @@ def place_crossed_market_buys(
         except GateApiException as exc:
             if not retryable(exc):
                 store.release_buy_reservation(reservation_id)
-            if exc.label in {"BALANCE_NOT_ENOUGH", "AUTO_BORROW_TOO_MUCH"}:
+            if exc.label in FUNDING_ERROR_LABELS:
                 print(f"[{now_text()}] 越价市价开仓资金/可借额度不足，暂停本轮")
                 return False
             raise
