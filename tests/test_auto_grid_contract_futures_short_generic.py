@@ -97,7 +97,7 @@ def test_short_limit_order_has_network_timeout():
 def test_short_strategy_code_cannot_collide_with_long_strategy_code():
     args = (
         "usdt", "SOXL_USDT", Decimal("150"), Decimal("0.003"),
-        Decimal("0.003"), Decimal("1.6"), Decimal("2"), "same-tag", 1,
+        Decimal("0.003"), Decimal("1.6"), Decimal("2"), "same-tag",
     )
     assert short_grid.short_futures_strategy_code(*args) != (
         long_grid.futures_strategy_code(*args)

@@ -172,11 +172,11 @@ class DatabaseGridTest(unittest.TestCase):
         planned = grid.PlannedOrder(Decimal("100"), Decimal("0.03"))
         first = self.store.reserve_buy_slot(
             "ETH_USDT", "code", planned, Decimal("100.3"),
-            "t-dbcode-first", 1,
+            "t-dbcode-first",
         )
         second = self.store.reserve_buy_slot(
             "ETH_USDT", "code", planned, Decimal("100.3"),
-            "t-dbcode-second", 1,
+            "t-dbcode-second",
         )
         self.assertIsNotNone(first)
         self.assertIsNone(second)
@@ -203,7 +203,6 @@ class DatabaseGridTest(unittest.TestCase):
             FakeApi(), self.store, "ETH_USDT", "code",
             [grid.PlannedOrder(Decimal("100"), Decimal("0.03"))],
             Decimal("0.003"), self.spec, True, "db",
-            max_unclosed_per_grid=1,
         )
         self.assertTrue(funded)
         row = self.store.active("ETH_USDT", "code")[0]
@@ -222,7 +221,6 @@ class DatabaseGridTest(unittest.TestCase):
                 FakeApi(), self.store, "ETH_USDT", "code",
                 [grid.PlannedOrder(Decimal("100"), Decimal("0.03"))],
                 Decimal("0.003"), self.spec, True, "db",
-                max_unclosed_per_grid=1,
             )
         row = self.store.active("ETH_USDT", "code")[0]
         self.assertIsNone(row["buy_order_id"])
@@ -234,7 +232,7 @@ class DatabaseGridTest(unittest.TestCase):
         planned = grid.PlannedOrder(Decimal("100"), Decimal("0.03"))
         row_id = self.store.reserve_buy_slot(
             "ETH_USDT", "code", planned, Decimal("100.3"),
-            "t-dbcode-reserved", 1,
+            "t-dbcode-reserved",
         )
         listener = grid.OrderListener(
             grid.threading.Event(), self.store, object(),
@@ -280,7 +278,7 @@ class DatabaseGridTest(unittest.TestCase):
             "ETH_USDT", "code", Decimal("100")
         ))
 
-    def test_configured_limit_three_allows_third_grid_cycle(self):
+    def test_fixed_limit_blocks_third_grid_cycle(self):
         first = self.insert(price="100")
         second = self.insert(price="100")
         self.store.execute(
@@ -302,10 +300,9 @@ class DatabaseGridTest(unittest.TestCase):
             FakeApi(), self.store, "ETH_USDT", "code",
             [grid.PlannedOrder(Decimal("100"), Decimal("0.03"))],
             Decimal("0.003"), self.spec, True, "db",
-            max_unclosed_per_grid=3,
         )
         self.assertTrue(funded)
-        self.assertEqual(3, len(self.store.active("ETH_USDT", "code")))
+        self.assertEqual(2, len(self.store.active("ETH_USDT", "code")))
 
     def test_grid_checker_cancels_pending_buy_after_two_exposures_accumulate(self):
         first = self.insert(price="100")
@@ -348,7 +345,6 @@ class DatabaseGridTest(unittest.TestCase):
         second_order_id = str(self.store.one(second)["buy_order_id"])
         grid.trim_outside_grid(
             api, self.store, "ETH_USDT", "code", {Decimal("100")},
-            max_unclosed_per_grid=1,
         )
         self.assertEqual([second_order_id], api.cancelled)
         self.assertIsNotNone(self.store.one(first))
@@ -447,7 +443,7 @@ class DatabaseGridTest(unittest.TestCase):
         funded = grid.place_crossed_market_buys(
             api, self.store, "ETH_USDT", "code",
             [grid.PlannedOrder(Decimal("100"), Decimal("0.03"))],
-            Decimal("3.1"), Decimal("0.003"), self.spec, False, "db", 1,
+            Decimal("3.1"), Decimal("0.003"), self.spec, False, "db",
         )
         self.assertTrue(funded)
         self.assertEqual("market", api.body.type)
@@ -1198,8 +1194,6 @@ class DatabaseGridTest(unittest.TestCase):
         first = grid.strategy_code(*args)
         changed = grid.strategy_code(*args[:-2], Decimal("3"), args[-1])
         self.assertNotEqual(first, changed)
-        changed_limit = grid.strategy_code(*args, max_unclosed_per_grid=3)
-        self.assertNotEqual(first, changed_limit)
         spot = grid.strategy_code(*args, account_mode="spot")
         self.assertNotEqual(first, spot)
 

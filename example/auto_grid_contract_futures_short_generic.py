@@ -69,13 +69,9 @@ def short_futures_strategy_code(
     margin: Decimal,
     leverage: Decimal,
     grid_tag: str,
-    max_unclosed_per_grid: int = 2,
 ) -> str:
     """生成包含做空方向的策略码，避免与同参数做多策略发生碰撞。"""
-    exposure_suffix = (
-        "" if max_unclosed_per_grid == 2
-        else f"|max-unclosed={max_unclosed_per_grid}"
-    )
+    exposure_suffix = "|max-unclosed=1"
     raw = (
         f"{grid_tag}|futures-short|{settle}|{contract}|{reference}|{step_pct}|"
         f"{take_profit_pct}|{margin}|{leverage}{exposure_suffix}"
@@ -341,7 +337,6 @@ def place_missing_shorts(
     tp_pct: Decimal,
     spec: core.PairSpec,
     prefix: str,
-    max_unclosed_per_grid: int = 2,
 ) -> bool:
     """在现价上方补做空开仓单（SELL）。"""
     rows = store.active(pair, code)
@@ -349,24 +344,26 @@ def place_missing_shorts(
         Decimal(row["buy_price"]) for row in rows if row["buy_status"] == core.WAIT_BUY
     }
     for planned in desired:
+        tp = short_take_profit_price(planned.price, tp_pct, spec)
+        if store.migrated_slot_occupied(pair, code, planned.price, tp):
+            continue
         activity = store.activity_count(pair, code, planned.price)
-        if activity >= max_unclosed_per_grid:
+        if activity >= 1:
             print(
                 f"[{core.now_text()}] {planned.price} 活动数量={activity}/"
-                f"{max_unclosed_per_grid}（待成交+已成交未平仓），跳过新开空单"
+                "1（待成交+已成交未平仓），跳过新开空单"
             )
             continue
         if planned.price in pending_prices:
             continue
-        tp = short_take_profit_price(planned.price, tp_pct, spec)
         order_text = core.make_order_text(prefix, code)
         reservation_id = store.reserve_buy_slot(
-            pair, code, planned, tp, order_text, max_unclosed_per_grid
+            pair, code, planned, tp, order_text
         )
         if reservation_id is None:
             print(
                 f"[{core.now_text()}] {planned.price} 挂单前原子占位失败："
-                f"活动数量已达到 {max_unclosed_per_grid}"
+                "该网格已有活动周期"
             )
             continue
         try:
@@ -1060,7 +1057,6 @@ class ShortGridChecker:
         take_profit_count: int,
         spec: core.PairSpec,
         cover_prefix: str,
-        max_unclosed_per_grid: int = 2,
         take_profit_available_size=None,
     ):
         self.stop = stop
@@ -1076,7 +1072,6 @@ class ShortGridChecker:
         self.take_profit_count = take_profit_count
         self.spec = spec
         self.cover_prefix = cover_prefix
-        self.max_unclosed_per_grid = max_unclosed_per_grid
         self.take_profit_available_size = take_profit_available_size
 
     def run(self) -> None:
@@ -1092,7 +1087,6 @@ class ShortGridChecker:
                 )
                 core.trim_outside_grid(
                     self.api, self.store, self.pair, self.code, desired_prices,
-                    self.max_unclosed_per_grid,
                 )
                 lower = short_take_profit_window_lower(
                     self.reference, current, self.step_pct,
@@ -1132,7 +1126,6 @@ def run_short_grid(
     short_grid_count: int = 10,
     take_profit_count: int = 10,
     take_profit_grid_count: int = 20,
-    max_unclosed_per_grid: int = 2,
     grid_step_pct="0.003",
     take_profit_pct="0.003",
     startup_mode: str = "resume",
@@ -1147,8 +1140,6 @@ def run_short_grid(
         raise ValueError("startup_mode 只能是 resume 或 reset")
     if short_grid_count <= 0 or take_profit_count <= 0 or take_profit_grid_count <= 0:
         raise ValueError("开空格、平仓单数量和平仓网格区间必须大于 0")
-    if max_unclosed_per_grid <= 0:
-        raise ValueError("max_unclosed_per_grid 必须大于 0")
     if poll_interval < 0.5:
         raise ValueError("poll_interval 不能小于 0.5 秒")
 
@@ -1220,13 +1211,20 @@ def run_short_grid(
 
     generated_code = short_futures_strategy_code(
         settle, contract, reference, step_pct, tp_pct, margin,
-        leverage_value, grid_tag, max_unclosed_per_grid,
+        leverage_value, grid_tag,
     )
     code = generated_code
-    if startup_mode == "resume":
-        existing_code = resume_short_strategy_code(store, contract)
-        if existing_code:
-            code = existing_code
+    try:
+        if startup_mode == "resume":
+            existing_code = resume_short_strategy_code(store, contract)
+            if existing_code:
+                code = existing_code
+    except Exception:
+        store.close()
+        process_lock.release()
+        for client in clients:
+            client.close()
+        raise
     if code != generated_code:
         print(
             f"[{core.now_text()}] 当前参数生成策略码={generated_code}，"
@@ -1239,7 +1237,6 @@ def run_short_grid(
         stop, store, apis[1], contract, code, price_state, reference, step_pct,
         short_grid_count, take_profit_grid_count, take_profit_count,
         contract_spec.grid_spec, cover_client_order_prefix,
-        max_unclosed_per_grid,
         take_profit_available_size=lambda: reconcile_short_position(
             apis[1], store, contract, code
         ),
@@ -1279,6 +1276,12 @@ def run_short_grid(
             api.position_mode = mode
         if startup_mode == "reset":
             core.reset_pair(apis[0], store, contract)
+        core.prepare_grid_resume(
+            apis[0], store, contract, code,
+            core.grid_layout_settings(reference, step_pct, tp_pct, margin,
+                                      leverage_value, f"futures:{settle}:short"),
+            contract_spec.grid_spec, state_reconciler,
+        )
         state_sync.start()
         listener.start()
         checker.start()
@@ -1303,7 +1306,6 @@ def run_short_grid(
                     funded = place_missing_shorts(
                         apis[0], store, contract, code, desired, tp_pct,
                         contract_spec.grid_spec, open_client_order_prefix,
-                        max_unclosed_per_grid,
                     )
                     if not funded:
                         balance_cooldown_until = (
@@ -1383,7 +1385,6 @@ def run_SOXL() -> None:
         short_grid_count=10,
         take_profit_count=10,
         take_profit_grid_count=20,  # 检查现价下方20个网格，最多保留10个平仓单
-        max_unclosed_per_grid=1,  # 单个网格价位最多保留的已成交未平仓周期数
         grid_step_pct="0.003",
         take_profit_pct="0.003",
         startup_mode="resume",

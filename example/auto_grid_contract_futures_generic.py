@@ -254,12 +254,8 @@ def futures_strategy_code(
     margin: Decimal,
     leverage: Decimal,
     grid_tag: str,
-    max_unclosed_per_grid: int = 2,
 ) -> str:
-    exposure_suffix = (
-        "" if max_unclosed_per_grid == 2
-        else f"|max-unclosed={max_unclosed_per_grid}"
-    )
+    exposure_suffix = "|max-unclosed=1"
     raw = (
         f"{grid_tag}|futures|{settle}|{contract}|{reference}|{step_pct}|"
         f"{take_profit_pct}|{margin}|{leverage}{exposure_suffix}"
@@ -562,7 +558,6 @@ def run_grid(
     buy_grid_count: int = 10,
     take_profit_count: int = 10,
     take_profit_grid_count: int = 20,
-    max_unclosed_per_grid: int = 2,
     grid_step_pct="0.003",
     take_profit_pct="0.003",
     startup_mode: str = "resume",
@@ -577,8 +572,6 @@ def run_grid(
         raise ValueError("startup_mode 只能是 resume 或 reset")
     if buy_grid_count <= 0 or take_profit_count <= 0 or take_profit_grid_count <= 0:
         raise ValueError("买格、止盈单数量和止盈网格区间必须大于 0")
-    if max_unclosed_per_grid <= 0:
-        raise ValueError("max_unclosed_per_grid 必须大于 0")
     if poll_interval < 0.5:
         raise ValueError("poll_interval 不能小于 0.5 秒")
 
@@ -650,15 +643,23 @@ def run_grid(
 
     code = futures_strategy_code(
         settle, contract, reference, step_pct, tp_pct, margin,
-        leverage_value, grid_tag, max_unclosed_per_grid,
+        leverage_value, grid_tag,
     )
+    try:
+        if startup_mode == "resume":
+            code = core.resume_strategy_code(store, contract) or code
+    except Exception:
+        store.close()
+        process_lock.release()
+        for client in clients:
+            client.close()
+        raise
     price_state = core.PriceState(current)
     stop = threading.Event()
     grid_checker = core.GridChecker(
         stop, store, apis[1], contract, code, price_state, reference, step_pct,
         buy_grid_count, take_profit_grid_count, take_profit_count,
         contract_spec.grid_spec, sell_client_order_prefix,
-        max_unclosed_per_grid,
         take_profit_available_size=lambda: reconcile_futures_position(
             apis[1], store, contract, code, "long"
         ),
@@ -705,6 +706,12 @@ def run_grid(
                     f"数据库中存在 {contract} 的其他未完成策略；"
                     "确认撤销旧策略后使用 startup_mode='reset'"
                 )
+        core.prepare_grid_resume(
+            apis[0], store, contract, code,
+            core.grid_layout_settings(reference, step_pct, tp_pct, margin,
+                                      leverage_value, f"futures:{settle}:long"),
+            contract_spec.grid_spec, state_reconciler,
+        )
         state_sync.start()
         listener.start()
         checker.start()
@@ -729,7 +736,6 @@ def run_grid(
                     funded = core.place_missing_buys(
                         apis[0], store, contract, code, desired, tp_pct,
                         contract_spec.grid_spec, False, buy_client_order_prefix,
-                        max_unclosed_per_grid,
                     )
                     if not funded:
                         balance_cooldown_until = (
@@ -809,7 +815,6 @@ def run_SOXL() -> None:
         buy_grid_count=10,
         take_profit_count=10,
         take_profit_grid_count=20,  # 检查现价上方20个网格，最多保留10个止盈单
-        max_unclosed_per_grid=1,  # 单个网格价位最多保留的已成交未止盈周期数
         grid_step_pct="0.003",
         take_profit_pct="0.003",
         startup_mode="resume",

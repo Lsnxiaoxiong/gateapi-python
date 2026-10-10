@@ -47,11 +47,11 @@ class FundingRetryTest(unittest.TestCase):
                             if direction == "long":
                                 place = core.place_missing_buys
                                 target, method = core, "create_limit_order"
-                                args += (False, "db", 1)
+                                args += (False, "db")
                             else:
                                 place = short_grid.place_missing_shorts
                                 target, method = short_grid, "create_futures_limit_order"
-                                args += ("db", 1)
+                                args += ("db",)
                             error = GateApiException(
                                 label, "insufficient margin", exp=ApiException(status=400),
                             )
@@ -100,7 +100,7 @@ class FundingRetryTest(unittest.TestCase):
             margin=Decimal("1"), leverage_value=Decimal("2"),
             contract_spec=SimpleNamespace(grid_spec=Mock()), store=store,
             tp_pct=Decimal("0.003"), buy_client_order_prefix="db",
-            open_client_order_prefix="db", max_unclosed_per_grid=1,
+            open_client_order_prefix="db",
             take_profit_grid_count=20, take_profit_count=10, poll_interval=1,
             time=SimpleNamespace(monotonic=lambda: ticks[0]),
             desired_buy_orders=Mock(return_value=[]),

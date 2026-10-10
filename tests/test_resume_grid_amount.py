@@ -18,7 +18,7 @@ class ResumeAmountTest(unittest.TestCase):
                     core.PlannedOrder(D("2500"), D("0.01")), D("2505"))
                 generated = core.strategy_code(
                     "ETH_USDT", D("2500"), D("0.0022"), D("0.0022"),
-                    D("8.3"), D("3"), "gdbgrid01", 1)
+                    D("8.3"), D("3"), "gdbgrid01")
                 self.assertNotEqual("80b7f14f", generated)
                 self.assertEqual("80b7f14f", core.resume_strategy_code(store, "ETH_USDT"))
                 self.assertEqual("80b7f14f", short.resume_short_strategy_code(store, "ETH_USDT"))

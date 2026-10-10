@@ -190,7 +190,7 @@ def test_futures_grid_uses_shared_atomic_activity_limit():
                 assert core.place_missing_buys(
                     api, store, "SOXL_USDT", "code", planned,
                     Decimal("0.003"), contract_spec().grid_spec,
-                    False, "fb", max_unclosed_per_grid=1,
+                    False, "fb",
                 )
             assert len(raw_api.created) == 1
             assert store.activity_count(
