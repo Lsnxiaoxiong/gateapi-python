@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Grid Canvas · 手绘行情与网格回测</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="model.js"></script><script defer src="drawing.js"></script><script defer src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#"><span class="brand-mark">▥</span><span>GRID<span class="brand-light">CANVAS</span><small>手绘行情 · 策略实验室</small></span></a>
+    <nav aria-label="工作区"><button class="tab active" data-tab="draw">01 <span>绘制行情</span></button><button class="tab" data-tab="replay">02 <span>网格回测</span></button></nav>
+    <span class="local-badge"><i></i> 本地运行 · 无需密钥</span>
+  </header>
+  <main>
+    <section id="draw-view">
+      <div class="page-heading"><div><div class="eyebrow">MARKET STUDIO</div><h1>把你的行情想法，画出来。</h1><p>从左到右绘制波动趋势，把每一列笔迹转化为价格，再让网格策略跑一遍。</p></div><span class="step-label">STEP 01 / 02</span></div>
+      <div class="draw-layout">
+        <section class="panel drawing-panel">
+          <div class="panel-bar"><div><span class="panel-dot"></span><strong>趋势画布</strong><span id="canvas-size" class="subtle">自动向四周扩展</span></div><div class="toolbar"><label class="inline-field">画笔 <select id="pen-width"><option value="2">2 px</option><option value="4" selected>4 px</option><option value="8">8 px</option><option value="14">14 px</option></select></label><button id="draw-home" class="ghost" title="返回初始视野，不改变笔迹">⌖ 起点</button><button id="undo" class="ghost">↶ 撤销</button><button id="clear-draw" class="ghost">清空</button></div></div>
+          <div class="draw-stage"><canvas id="draw-canvas" width="1200" height="400" tabindex="0" aria-label="从左到右手绘价格走势，靠近四边自动扩展，按住空格拖动或使用滚轮移动视野"></canvas><div id="draw-placeholder"><span class="draw-icon">〰</span><strong>按住鼠标或触控笔，画一条走势</strong><span>向上代表上涨，向下代表下跌 · 靠近四边自动扩展</span></div></div>
+          <div class="canvas-navigation"><span>绘制到边缘自动延伸 · 空格拖动 / 滚轮移动视野</span><span id="view-position">视野 X 0 · Y 0</span></div>
+          <div class="canvas-footer"><span><i class="legend-dot teal"></i> 原始笔迹 <i class="legend-dot amber"></i> 每列像素平均线</span><span id="draw-info">等待绘制</span></div>
+          <div class="sample-bar"><span class="subtle">快速体验</span><button data-preset="wave" class="chip">↝ 震荡行情</button><button data-preset="down" class="chip">↘ 下跌反弹</button><button data-preset="up" class="chip">↗ 趋势上涨</button></div>
+          <div class="preview-block"><div class="mini-heading"><strong>K 线预览</strong><span id="preview-count" class="subtle">绘制后自动生成</span></div><canvas id="preview-canvas" aria-label="生成的 K 线预览"></canvas></div>
+        </section>
+        <aside class="panel config-panel"><div class="panel-bar"><strong>价格与时间映射</strong><span class="tag">可调整</span></div><div class="panel-body">
+          <label>数据名称<input id="data-name" value="我的手绘行情" maxlength="80"></label>
+          <div class="two-fields"><label>起始价格<input id="start-price" type="number" value="100" min="0.000001" step="any"><small>左边第一列的价格</small></label><label>每像素幅度<input id="pixel-value" type="number" value="0.1" min="0.000001" step="any"><small>纵向 1 像素的价格变化</small></label></div>
+          <div class="two-fields"><label>每根 K 线像素数<input id="pixels-per-candle" type="number" value="6" min="1" max="1200"><small>横向像素按组聚合 OHLC</small></label><label>K 线周期<select id="interval"><option value="1">1 秒</option><option value="60" selected>1 分钟</option><option value="300">5 分钟</option><option value="3600">1 小时</option><option value="86400">1 天</option></select></label></div>
+          <label>起始时间（本地时间）<input id="start-time" type="datetime-local"></label>
+          <div class="formula"><span>价格换算</span><code>P(x) = P₀ + [ȳ(0) − ȳ(x)] × 幅度</code><p>只统计画笔像素，忽略背景。断笔间线性补齐；左侧空白沿用首列笔迹，右侧未绘制部分不生成数据。</p></div>
+          <div id="draw-error" class="inline-error" role="status"></div><button id="save-data" class="primary full">保存行情并用于回测 <span>↗</span></button>
+          <div class="two-buttons"><button id="export-draw-json">导出 JSON</button><button id="export-draw-csv">导出 CSV</button></div>
+          <p class="hint">JSON 保留手绘的逐像素价格路径；CSV 仅保留 OHLC。手绘成交量为 0。</p>
+        </div></aside>
+      </div>
+    </section>
+    <section id="replay-view" hidden>
+      <div class="page-heading"><div><div class="eyebrow">STRATEGY REPLAY</div><h1>同一段行情，多一种答案。</h1><p>添加网格策略，观察挂单如何随着价格成交、止盈与重新布置。</p></div><button id="add-strategy" class="primary">＋ 添加网格策略</button></div>
+      <div class="replay-layout">
+        <aside class="strategy-sidebar"><div class="sidebar-title"><strong>Gate 合约网格</strong><span id="strategy-count" class="tag"></span></div><div id="strategy-list"></div><div class="note">锚定参考价 · 窗口随现价移动<br>多头：下方买开，上方卖平。空头反向。每个入场价仅一个活动周期，旧仓不会因移出窗口而平掉。<br>实线为开仓，虚线为止盈；颜色区分策略。</div></aside>
+        <div class="replay-main">
+          <section class="panel replay-panel">
+            <div class="replay-controls"><label class="dataset-field">行情数据<select id="dataset-select"></select></label><label>K 线内路径<select id="path-mode"><option value="low-first">开 → 低 → 高 → 收</option><option value="high-first">开 → 高 → 低 → 收</option></select></label><span id="path-badge" class="tag">OHLC 模拟</span></div>
+            <div class="playback-bar"><div class="toolbar"><button id="run" class="primary">▶ 开始回测</button><button id="step">单步</button><button id="reset" class="ghost">↺ 重置</button><button id="finish" class="ghost">运行到最后</button></div><label class="inline-field">速度 <select id="speed"><option value="2">2 根/秒</option><option value="10" selected>10 根/秒</option><option value="50">50 根/秒</option><option value="200">200 根/秒</option></select></label></div>
+            <div class="chart-head"><div><strong id="chart-title">请选择行情数据</strong><span id="current-time" class="subtle"></span></div><span id="current-price" class="price-display">—</span></div>
+            <div class="chart-wrap"><canvas id="replay-canvas" aria-label="K 线、策略挂单及成交动态图"></canvas><div id="chart-tooltip" hidden></div></div>
+            <div class="progress-row"><span id="run-state" class="tag">未开始</span><progress id="progress" value="0" max="1"></progress><span id="progress-label">0 / 0</span></div>
+            <div id="replay-error" class="inline-error" role="status"></div><div id="chart-legend" class="chart-legend"></div>
+          </section>
+          <div class="summary-grid"><div class="stat"><span>组合总盈亏</span><strong id="total-pnl">—</strong><small>已实现 + 浮动，含已付手续费</small></div><div class="stat"><span>已实现盈亏</span><strong id="realized-pnl">—</strong><small>完成买卖周期的净收益</small></div><div class="stat"><span>累计手续费</span><strong id="total-fees">—</strong><small>买卖双边计费</small></div><div class="stat"><span>完成网格 / 当前挂单</span><strong id="cycle-count">—</strong><small>各策略独立撮合后合计</small></div></div>
+          <section class="panel"><div class="panel-bar"><strong>策略表现</strong><button id="export-report" class="ghost">↓ 导出回测报告</button></div><div class="table-scroll"><table><thead><tr><th>策略</th><th>总盈亏</th><th>已实现</th><th>浮动盈亏</th><th>净值</th><th>可用 / 预留</th><th>持仓保证金</th><th>持仓 / 待挂止盈</th><th>最大回撤</th><th>手续费</th></tr></thead><tbody id="results-body"></tbody></table></div></section>
+          <section class="panel"><div class="panel-bar"><strong>挂单与成交</strong><div class="toolbar"><label class="inline-field">查看策略 <select id="order-filter"><option value="all">全部策略</option></select></label><button id="export-trades" class="ghost">↓ 导出成交 CSV</button></div></div><div class="detail-columns"><div><div class="mini-heading"><strong>当前挂单</strong><span id="order-count" class="subtle"></span></div><div class="table-scroll bounded"><table><thead><tr><th>策略</th><th>方向</th><th>价格</th><th>张数</th></tr></thead><tbody id="orders-body"></tbody></table></div></div><div><div class="mini-heading"><strong>最近成交</strong><span class="subtle">显示最近 100 笔</span></div><div class="table-scroll bounded"><table><thead><tr><th>策略 / 时间</th><th>方向</th><th>价格</th><th>净收益</th></tr></thead><tbody id="trades-body"></tbody></table></div></div></div></section>
+          <details class="method-note"><summary>Gate 网格规则与回测口径</summary><p>对应本项目 auto_grid_contract_futures_generic.py / auto_grid_contract_futures_short_generic.py。多头价位为参考价 × (1 − 间隔)^索引，空头为参考价 × (1 + 间隔)^索引；索引可为负，无固定价格上下限。只维护现价下方最近 N 个多头买格或上方最近 N 个开空格，区间外开仓单撤销；已开仓保留且同入场价不重复开仓。</p><p>止盈独立于网格间隔。多头：入场价 × (1 + 止盈比例) 向上对齐价格步长；空头：入场价 × (1 − 止盈比例) 向下对齐。仅在止盈检查窗口内维护最靠近现价的指定数量止盈单；超窗撤单保留仓位，回到窗口后再挂。初始无底仓，不在参考价直接开仓。</p><p>保证金 × 杠杆换算名义金额，再按合约面值和张数步长向下取整。规格采用离线示例，须按目标合约填写。回测资金用于模拟可用保证金，资金不足暂停新增开仓，已有仓位和止盈继续维护。</p><p>手绘 JSON 使用逐像素路径，普通 OHLC 按所选高低顺序模拟；跳空按穿越顺序以限价成交。采用路径上的即时挂撤单模型，不复刻实盘轮询间隔、网络延迟、SQLite 恢复、部分成交和外部手动平仓。不模拟强平、滑点或资金费率，未扣未来平仓费。净值 = 回测资金 + 已实现净收益 + 持仓浮动净收益，回撤按路径时点及成交统计。</p><p>每个策略独立资金，不共用保证金。最多 12 个策略，每策略活动开仓格数及止盈单各最多 300，止盈检查范围最多 1000 格；活动窗口不限制累计持仓数。行情最多 200,000 根。每策略仅保留最近约 10,000 笔成交日志，完整累计指标不受影响；导出会注明日志是否截断。</p></details>
+        </div>
+      </div>
+    </section>
+    <section class="panel library-panel"><div class="panel-bar"><div><strong>行情资料库</strong><span class="subtle">浏览器本地保存</span></div><div class="toolbar"><input id="file-input" type="file" accept=".csv,.json" hidden><button id="import-data">↑ 导入 CSV / JSON</button><button id="demo-data" class="ghost">载入示例行情</button></div></div><div id="dataset-library" class="dataset-library"></div><p class="library-note">CSV 列：time, open, high, low, close, volume；支持标准 Binance 列序。时间可为秒、毫秒或带时区的 ISO 时间。大文件保留在当前会话，请自行导出备份。</p></section>
+  </main>
+  <footer>GRID CANVAS <span>手绘情景与网格策略的本地实验空间</span><span>全部计算在你的浏览器中完成</span></footer>
+  <div id="toast" role="status" hidden></div>
+</body>
+</html>

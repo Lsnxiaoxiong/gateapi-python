@@ -5,7 +5,7 @@ def run_FLOCK() -> None:
     run_short_grid(
         contract="FLOCK_USDT",
         reference_price="0.076",
-        margin_amount_per_order="0.148",  # 每格保证金；名义仓位约为保证金×杠杆
+        margin_amount_per_order="0.11",  # 每格保证金；名义仓位约为保证金×杠杆
         leverage="1",
         settle="usdt",
         short_grid_count=10,

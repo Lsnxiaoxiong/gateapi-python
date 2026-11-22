@@ -4,16 +4,16 @@ from example.auto_grid_contract_futures_short_generic import run_short_grid, DEF
 def run_ETH() -> None:
     run_short_grid(
         contract="ETH_USDT",
-        reference_price="2500",
-        margin_amount_per_order="2.42",  # 每格保证金；名义仓位约为保证金×杠杆
-        leverage="2",
+        reference_price="2300",
+        margin_amount_per_order="0.98",  # 每格保证金；名义仓位约为保证金×杠杆
+        leverage="3",
         settle="usdt",
         short_grid_count=10,
         take_profit_count=10,
         take_profit_grid_count=20,  # 检查现价下方20个网格，最多保留10个平仓单
-        grid_step_pct="0.002",
-        take_profit_pct="0.002",
-        startup_mode="resume",
+        grid_step_pct="0.00042",
+        take_profit_pct="0.00042",
+        startup_mode="reset",
         database_path=DEFAULT_DATABASE,
         poll_interval=2,
     )

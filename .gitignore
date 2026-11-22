@@ -50,6 +50,7 @@ venv/
 .pytest_cache
 
 # Local state created by the persistent margin-grid example
+example/.transfer_state/
 example/grid_orders.sqlite3*
 
 # Translations

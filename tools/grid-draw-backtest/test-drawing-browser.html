@@ -1,0 +1,52 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Drawing raster regression tests</title>
+<pre id="result">Running…</pre>
+<script src="model.js"></script><script src="drawing.js"></script>
+<script>
+'use strict';
+try {
+  const create = () => document.createElement('canvas');
+  const world = new GridDrawing.InkWorld(create);
+  const reference = create(); reference.width = 1536; reference.height = 1024;
+  const ctx = reference.getContext('2d', { willReadFrequently: true });
+  const paths = [
+    { width: 4, points: [{ x: -300, y: -280 }, { x: 260, y: 290 }, { x: 760, y: 80 }] },
+    { width: 14, points: [{ x: 255.5, y: -260.5 }, { x: 257.4, y: 380.2 }] },
+    { width: 8, points: [{ x: -260, y: 260 }, { x: 600, y: -260 }] }
+  ];
+  for (const stroke of paths) {
+    stroke.points.forEach((to, i) => {
+      const from = stroke.points[i - 1]; world.line(stroke, from, to);
+    });
+    // Scan the actual composited ink independently, including antialias pixels
+    // and overlaps. Cached incremental statistics must match what is painted.
+    ctx.clearRect(0, 0, reference.width, reference.height);
+    world.paint(ctx, { x: -512, y: -512 }, reference.width, reference.height);
+    const sample = world.sample();
+    const means = GridLab.columnMeans(ctx.getImageData(0, 0, 1536, 1024).data, 1536, 1024);
+    sample.columns.forEach((value, i) => {
+      const raw = means[sample.left + i + 512], expected = raw == null ? null : raw - 512;
+      if (value == null ? expected != null : expected == null || Math.abs(value - expected) > 1e-8) {
+        throw new Error(`Pixel mean differs at world x=${sample.left + i}: ${value} vs ${expected}`);
+      }
+    });
+  }
+  if (!ctx.getImageData(212, 232, 1, 1).data[3]) throw new Error('Negative-coordinate stroke was clipped');
+  if (!ctx.getImageData(768, 512, 1, 1).data[3]) throw new Error('Stroke has a gap at a tile seam');
+  const before = JSON.stringify(world.sample());
+  const viewport = create(); viewport.width = 1200; viewport.height = 400;
+  world.paint(viewport.getContext('2d'), { x: -400.4, y: 300.7 }, 1200, 400);
+  if (JSON.stringify(world.sample()) !== before) throw new Error('Moving the viewport changed samples');
+  const sample = world.sample();
+  const mapping = GridLab.pricesFromColumns(sample.columns, 1000, .1);
+  const candles = GridLab.candlesFromPrices(mapping.prices, 6, Date.UTC(2026, 10, 14), 60);
+  if (candles[0].open !== 1000) throw new Error('Extended left edge lost its starting-price anchor');
+  world.clear();
+  if (world.sample().columns.length || world.tiles.size) throw new Error('Clear left stale pixels');
+  document.querySelector('#result').textContent = 'PASS: negative coordinates, tile seams, overlapping strokes, incremental means, viewport invariance, OHLC generation and clear';
+} catch (error) {
+  document.querySelector('#result').textContent = 'FAIL: ' + error.stack;
+  throw error;
+}
+</script>

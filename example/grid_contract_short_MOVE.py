@@ -5,14 +5,14 @@ def run_MOVE() -> None:
     run_short_grid(
         contract="MOVE_USDT",
         reference_price="0.0086",
-        margin_amount_per_order="0.15",  # 每格保证金；名义仓位约为保证金×杠杆
+        margin_amount_per_order="0.09",  # 每格保证金；名义仓位约为保证金×杠杆
         leverage="1",
         settle="usdt",
         short_grid_count=10,
         take_profit_count=10,
         take_profit_grid_count=20,  # 检查现价下方20个网格，最多保留10个平仓单
-        grid_step_pct="0.0025",
-        take_profit_pct="0.0025",
+        grid_step_pct="0.002",
+        take_profit_pct="0.002",
         startup_mode="resume",
         database_path=DEFAULT_DATABASE,
         poll_interval=2,

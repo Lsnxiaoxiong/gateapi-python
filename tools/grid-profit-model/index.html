@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>网格收益实验室</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="model.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-icon" aria-hidden="true">▥</span><div><strong>网格收益实验室</strong><small>GRID RETURN LAB / 按每日成交次数估算</small></div></div>
+    <div class="top-actions"><span class="local-badge">本地计算 · 无需密钥</span><button id="export" type="button" disabled>导出结果 CSV</button></div>
+  </header>
+  <main>
+    <aside class="parameters">
+      <div class="section-heading"><h1>策略参数</h1><span>修改后自动计算</span></div>
+      <form id="parameters" novalidate>
+        <div class="field"><label for="countMode" class="field-name">成交次数口径</label><select id="countMode" name="countMode" class="count-mode"><option value="rounds">完整买卖轮次（买入＋止盈）</option><option value="orders">单边成交笔数（买卖合计）</option></select></div>
+        <div id="primary-fields"></div>
+        <p id="count-hint" class="hint">—</p>
+        <h2>周期与交易对参数</h2>
+        <div class="field-grid" id="grid-fields"></div>
+        <h2>下跌持仓情景</h2>
+        <div id="scenario-fields"></div>
+        <p class="hint">最小张数按数量步长使用：每格张数向下取整，仓位金额=张数×价格，与给定代码一致。</p>
+      </form>
+      <div id="validation" class="notice error" role="alert" hidden></div>
+      <div class="formula-box"><span>每格完成一轮净收益</span><strong id="unit-profit">—</strong><code>n × [b − m × (2 + b)]</code><small id="break-even">—</small></div>
+      <div id="warnings" class="notice" hidden></div>
+      <div class="parameter-actions"><button id="code-example" type="button">使用代码示例</button><button id="reset" type="button" class="quiet">恢复默认</button></div>
+      <p class="hint">成交次数可填小数，表示日均值。固定成交次数时，网格间隔 a 用于设置挂单价格，不直接改变收益。</p>
+    </aside>
+    <section class="workspace" aria-label="按成交次数计算的收益结果">
+      <div class="workspace-heading"><div><div class="eyebrow">DAILY TRADES → NET PROFIT</div><h2>按每日成交次数计算收益</h2><p id="run-description">正在计算…</p></div><span id="status" class="status" role="status" aria-live="polite">准备中</span></div>
+      <div class="metrics" aria-live="polite" aria-label="收益与手续费">
+        <article class="metric lead"><span>累计已实现净收益</span><strong id="total-net">—</strong><small id="total-period">—</small></article>
+        <article class="metric"><span>每日净收益</span><strong id="daily-net">—</strong><small id="daily-rounds">—</small></article>
+        <article class="metric"><span>累计交易手续费</span><strong id="total-fees">—</strong><small>包含买入、止盈卖出两侧</small></article>
+        <article class="metric"><span>累计完成轮数</span><strong id="total-rounds">—</strong><small id="total-orders">—</small></article>
+      </div>
+      <section class="drop-section" aria-label="下跌后最大持仓">
+        <div class="chart-heading"><div><h3>下跌后对应的最大持仓</h3><span id="drop-description">—</span></div></div>
+        <div class="drop-metrics" aria-live="polite">
+          <article class="metric"><span>最大持仓格数</span><strong id="max-open-grids">—</strong><small id="touched-grids">—</small></article>
+          <article class="metric"><span>最大持仓金额（按每格预算）</span><strong id="max-notional">—</strong><small id="budget-calculation">—</small></article>
+          <article class="metric"><span>最小张数取整后的实际金额</span><strong id="rounded-notional">—</strong><small id="max-quantity">—</small></article>
+        </div>
+        <p id="grid-count-formula" class="scenario-cost">—</p>
+        <p id="scenario-cost" class="scenario-cost">—</p>
+        <p class="hint">网格数量由间隔和跌幅自动计算，最大预算持仓=格数×每格仓位。假设第 0 格在开始价格买入，单边下跌、途中不反弹止盈，不限制资金。开始价格与最小张数只影响实际数量和取整差额；金额均为买入额，并非下跌后的市值。</p>
+      </section>
+      <section class="chart-section">
+        <div class="chart-heading"><div><h3>累计收益与手续费</h3><span>假设每日成交量与每格仓位保持不变，不复利</span></div><span class="unit-label">USDT</span></div>
+        <div class="legend" id="pnl-legend"></div>
+        <div id="pnl-chart" class="chart" role="img" aria-label="累计净收益、手续费前毛收益和累计手续费随天数变化"></div>
+      </section>
+      <div class="detail-grid">
+        <section class="chart-section"><div class="chart-heading"><div><h3>每日成交次数对收益的影响</h3><span id="sensitivity-description">—</span></div><span class="unit-label">USDT</span></div><div id="frequency-chart" class="chart" role="img" aria-label="其他参数固定时不同每日成交次数对应的累计净收益"></div></section>
+        <section class="sample-section"><div class="chart-heading"><div><h3>计算明细与网格金额</h3><span>收益按预算估算，持仓金额按数量取整</span></div></div><dl id="account-stats"></dl></section>
+      </div>
+      <details class="model-notes"><summary>网格价格、取整仓位与累计持仓明细</summary><p id="grid-table-summary">—</p><p>张数为 0 的格子无法下单，不计入实际持仓，预算持仓仍按每格预算累加。</p><div class="grid-preview"><table><thead><tr><th>网格序号</th><th>买入价（USDT）</th><th>止盈价（USDT）</th><th>下跌幅度</th><th>张数</th><th>实际仓位（USDT）</th><th>累计实际仓位（USDT）</th><th>累计预算仓位（USDT）</th></tr></thead><tbody id="grid-prices"></tbody></table></div></details>
+      <div class="notice">收益以达到输入成交量为前提，仅计算已完成买卖的净利润。成交次数不能推导价格路径、未平仓浮亏、最大回撤或盈利概率，因此这里不再展示这些指标。</div>
+      <details class="model-notes"><summary>模型口径与计算说明</summary><div>
+        <p>默认每日成交次数 d 表示完成的买卖轮数，一轮包含一次买入和一次止盈卖出。选择“单边成交笔数”时，按买卖配对假设，将输入笔数除以 2 折算为完成轮数；未配对买入不属于本模型。小数表示日均折算量，不代表可执行半笔订单。</p>
+        <p>每格买入名义金额为 n，止盈比例为 b，单边手续费率为 m。单轮毛收益=n×b，双边手续费=n×m×(2+b)，单轮净收益=n×[b−m×(2+b)]。累计净收益=日均完成轮数×天数×单轮净收益。</p>
+        <p>买价为 P₀(1−a)<sup>j</sup>，从第 0 格开始。下跌 r 后，触发格数 K=floor[ln(1−r)/ln(1−a)]+1（a、r 换算为小数）。K 为自动计算结果，最大预算持仓=K×n，不设手动格数上限。间隔 1%、下跌 32% 时 K=39，包含开始价格的第 0 格。等比例网格下跌至零需要无限格，所以跌幅须小于 100%。</p>
+        <p>设最小张数为 q，每格实际张数=floor[n/(q×买价)]×q，实际仓位=张数×买价。实际持仓为自动生成的全部触发网格逐格取整后合计。格子金额不足一份最小张数时跳过；取整计算修正极小的浮点边界误差。若交易所有额外合约面值，需先换算为此处“数量×价格”对应的数量步长。</p>
+        <p>收益曲线按每格预算 n 估算；网格明细和下跌持仓按取整后的实际金额计算。两者独立，不将下跌持仓与已实现收益合成一个账户曲线。买入所需金额含已付买入手续费，不预扣未来卖出手续费。不设置资金上限或基于本金的收益率。</p>
+        <p>只估算已实现交易收益，不含未平仓浮动盈亏、滑点、部分成交和其他成本；总账户收益仍需结合实际持仓。手续费假设以 USDT 支付，无杠杆，不连接真实交易账户。</p>
+      </div></details>
+    </section>
+  </main>
+  <footer>GRID RETURN LAB <span>累计已实现净收益 = 每日完成轮数 × 天数 × 单轮净收益</span></footer>
+  <div id="chart-tooltip" class="chart-tooltip" hidden></div>
+</body>
+</html>

@@ -18,7 +18,7 @@ sudo systemctl start gate-grid-bot
 sudo systemctl start gate-grid-hemi
 sudo systemctl disable gate-grid-hemi
 
-sudo systemctl stop gate-grid-bot
+sudo systemctl stop gate-grid-contract-eth.service
 sudo systemctl stop gate-grid-skhynix
 sudo systemctl restart gate-grid-skhynix
 sudo systemctl restart gate-grid-hemi
@@ -37,3 +37,4 @@ sudo journalctl -u gate-grid-btc -f
 sudo journalctl -u gate-grid-eth -f
 sudo journalctl -u gate-grid-contract-eth.service -f
 sudo journalctl -u gate-grid-hype -f
+sudo journalctl -u gate-auto-balance.service -f
