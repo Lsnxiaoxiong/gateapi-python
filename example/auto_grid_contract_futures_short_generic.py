@@ -1132,6 +1132,7 @@ def run_short_grid(
     database_path: Path = DEFAULT_DATABASE,
     poll_interval: float = 2.5,
     max_cycles: Optional[int] = None,
+    live_trading: Optional[bool] = None,
 ) -> None:
     contract = str(contract).strip().upper().replace("-", "_")
     settle = str(settle).strip().lower()
@@ -1153,8 +1154,10 @@ def run_short_grid(
 
     core.load_env_file()
     host = os.getenv("GATE_HOST", "https://api.gateio.ws/api/v4").strip()
-    ws_url = os.getenv("GATE_FUTURES_WS_URL", DEFAULT_WS_URL).strip()
-    live = os.getenv("GATE_LIVE_CONFIRM", "") == LIVE_CONFIRM_TEXT
+    ws_url = ref.futures_ws_url(settle)
+    # 显式传入时只由入口文件控制；未传入时兼容原有环境变量开关。
+    live = (os.getenv("GATE_LIVE_CONFIRM", "") == LIVE_CONFIRM_TEXT
+            if live_trading is None else live_trading)
     public_client = ApiClient(make_configuration(host))
     try:
         public_futures = FuturesApi(public_client)
@@ -1173,17 +1176,21 @@ def run_short_grid(
         if not live:
             print(
                 f"合约做空安全预览：{contract}，结算币={settle.upper()}，"
-                f"当前价={current}，每张={contract_spec.multiplier} "
-                f"{contract_spec.grid_spec.base_currency}，数据库={database_path}"
+                f"当前价={current}，合约类型={contract_spec.contract_type}，"
+                f"每张={contract_spec.multiplier} "
+                f"{'USD' if contract_spec.contract_type == 'inverse' else contract_spec.grid_spec.base_currency}，"
+                f"每格保证金={margin} {'BTC' if contract_spec.contract_type == 'inverse' else settle.upper()}，"
+                f"数据库={database_path}"
             )
             for order in desired:
-                notional = order.size * order.price * contract_spec.multiplier
+                notional = ref.futures_order_notional(order, contract_spec)
                 print(
                     f"开空卖价={order.price} 张数={order.size} "
-                    f"名义价值={core.decimal_text(notional)} USDT "
+                    f"名义价值={core.decimal_text(notional)} "
+                    f"{'USD' if contract_spec.contract_type == 'inverse' else settle.upper()} "
                     f"计划平仓={short_take_profit_price(order.price, tp_pct, contract_spec.grid_spec)}"
                 )
-            print(f"实盘需 GATE_LIVE_CONFIRM={LIVE_CONFIRM_TEXT}")
+            print("当前为预览模式；实盘需在入口文件启用 LIVE_TRADING，或使用原有环境变量确认")
             return
     finally:
         public_client.close()

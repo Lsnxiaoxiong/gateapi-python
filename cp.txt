@@ -29,6 +29,7 @@ sudo systemctl status gate-grid-bot
 
 
 
+sudo journalctl -u gate-grid-btc-cm-long.service -f
 sudo journalctl -u gate-grid-skhynix -f
 sudo journalctl -u gate-grid-bot -f
 sudo journalctl -u gate-grid-hemi -f

@@ -1,4 +1,4 @@
-"""Gate USDT 永续合约 SQLite 网格。
+"""Gate 永续合约 SQLite 网格（支持 BTC_USD 反向合约）。
 
 本文件复用 ``auto_grid_futures_generic.py`` 已验证的网格状态机、数据库结构、
 GridChecker 和订单恢复逻辑，只把交易接口替换为 Gate FuturesApi。
@@ -47,6 +47,7 @@ class FuturesContractSpec:
     multiplier: Decimal
     leverage_min: Decimal
     leverage_max: Decimal
+    contract_type: str = "direct"
 
 
 class _MappedJob:
@@ -180,12 +181,21 @@ def get_contract_spec(
     )
     if str(item.name) != contract or str(item.status) != "trading":
         raise RuntimeError(f"合约 {contract} 不存在或当前不可交易")
-    multiplier = core.decimal_value("quanto_multiplier", item.quanto_multiplier)
+    contract_type = str(getattr(item, "type", "") or "").lower()
+    if contract_type == "inverse":
+        # BTC_USD 每张固定 1 USD 面值，API 的 quanto_multiplier=0 不适用于张数计算。
+        if settle != "btc" or contract != "BTC_USD":
+            raise ValueError("仅支持已核实面值的 BTC_USD 币本位反向合约")
+        multiplier = Decimal("1")  # 反向合约：USD/张
+    elif contract_type == "direct":
+        multiplier = core.decimal_value("quanto_multiplier", item.quanto_multiplier)
+    else:
+        raise ValueError(f"不支持的合约类型：{contract_type!r}")
     min_size = core.decimal_value("order_size_min", item.order_size_min)
     size_step = min_size if bool(item.enable_decimal) else Decimal("1")
     grid_spec = core.PairSpec(
         base_currency=contract.split("_")[0],
-        quote_currency=settle.upper(),
+        quote_currency="USD" if contract_type == "inverse" else settle.upper(),
         amount_step=size_step,
         price_step=core.decimal_value("order_price_round", item.order_price_round),
         min_base_amount=min_size,
@@ -198,6 +208,7 @@ def get_contract_spec(
         multiplier=multiplier,
         leverage_min=Decimal(str(item.leverage_min or "1")),
         leverage_max=Decimal(str(item.leverage_max or "1")),
+        contract_type=contract_type,
     )
 
 
@@ -208,22 +219,43 @@ def calculate_contract_size(
     spec: FuturesContractSpec,
 ) -> Decimal:
     """将每格保证金换算成合约张数，向下对齐合约数量步长。"""
-    raw = margin * leverage / (price * spec.multiplier)
-    size = core.round_to_step(
-        raw, spec.grid_spec.amount_step, ROUND_DOWN
-    )
-    if size <= 0 or size < spec.grid_spec.min_base_amount:
-        minimum_notional = (
-            spec.grid_spec.min_base_amount * price * spec.multiplier
+    if spec.contract_type == "inverse":
+        # margin 单位 BTC，price 单位 USD/BTC，multiplier 单位 USD/张。
+        raw = margin * leverage * price / spec.multiplier
+        minimum_margin = (
+            spec.grid_spec.min_base_amount * spec.multiplier / price / leverage
         )
-        minimum_margin = minimum_notional / leverage
+        margin_currency = "BTC"
+    else:
+        raw = margin * leverage / (price * spec.multiplier)
+        minimum_margin = (
+            spec.grid_spec.min_base_amount * price * spec.multiplier / leverage
+        )
+        margin_currency = spec.grid_spec.quote_currency
+    size = core.round_to_step(raw, spec.grid_spec.amount_step, ROUND_DOWN)
+    if size <= 0 or size < spec.grid_spec.min_base_amount:
         raise ValueError(
-            f"单格保证金不足：当前 {core.decimal_text(margin)} USDT，"
-            f"此价格和杠杆下至少约需 {core.decimal_text(minimum_margin)} USDT"
+            f"单格保证金不足：当前 {core.decimal_text(margin)} {margin_currency}，"
+            f"此价格和杠杆下至少约需 {core.decimal_text(minimum_margin)} {margin_currency}"
         )
     if size > spec.grid_spec.max_base_amount:
         raise ValueError("单格张数超过合约最大下单数量")
     return size
+
+
+def futures_order_notional(order: core.PlannedOrder, spec: FuturesContractSpec) -> Decimal:
+    """返回计划订单的 USD/USDT 名义价值，供安全预览使用。"""
+    return (order.size * spec.multiplier if spec.contract_type == "inverse"
+            else order.size * order.price * spec.multiplier)
+
+
+def futures_ws_url(settle: str) -> str:
+    """按结算市场选择 WebSocket，避免误订阅 USDT 市场。"""
+    default = f"wss://fx-ws.gateio.ws/v4/ws/{settle}"
+    url = os.getenv("GATE_FUTURES_WS_URL", "").strip() or default
+    if settle == "btc" and not url.rstrip("/").lower().endswith("/btc"):
+        raise ValueError("BTC 币本位合约必须连接 /v4/ws/btc；请修改 GATE_FUTURES_WS_URL")
+    return url
 
 
 def desired_buy_orders(
@@ -564,6 +596,7 @@ def run_grid(
     database_path: Path = DEFAULT_DATABASE,
     poll_interval: float = 2.5,
     max_cycles: Optional[int] = None,
+    live_trading: Optional[bool] = None,
 ) -> None:
     contract = str(contract).strip().upper().replace("-", "_")
     settle = str(settle).strip().lower()
@@ -585,8 +618,10 @@ def run_grid(
 
     core.load_env_file()
     host = os.getenv("GATE_HOST", "https://api.gateio.ws/api/v4").strip()
-    ws_url = os.getenv("GATE_FUTURES_WS_URL", DEFAULT_WS_URL).strip()
-    live = os.getenv("GATE_LIVE_CONFIRM", "") == LIVE_CONFIRM_TEXT
+    ws_url = futures_ws_url(settle)
+    # 显式传入时只由入口文件控制；未传入时兼容原有环境变量开关。
+    live = (os.getenv("GATE_LIVE_CONFIRM", "") == LIVE_CONFIRM_TEXT
+            if live_trading is None else live_trading)
     public_client = ApiClient(make_configuration(host))
     try:
         public_futures = FuturesApi(public_client)
@@ -605,17 +640,21 @@ def run_grid(
         if not live:
             print(
                 f"合约安全预览：{contract}，结算币={settle.upper()}，"
-                f"当前价={current}，每张={contract_spec.multiplier} "
-                f"{contract_spec.grid_spec.base_currency}，数据库={database_path}"
+                f"当前价={current}，合约类型={contract_spec.contract_type}，"
+                f"每张={contract_spec.multiplier} "
+                f"{'USD' if contract_spec.contract_type == 'inverse' else contract_spec.grid_spec.base_currency}，"
+                f"每格保证金={margin} {'BTC' if contract_spec.contract_type == 'inverse' else settle.upper()}，"
+                f"数据库={database_path}"
             )
             for order in desired:
-                notional = order.size * order.price * contract_spec.multiplier
+                notional = futures_order_notional(order, contract_spec)
                 print(
                     f"买价={order.price} 张数={order.size} "
-                    f"名义价值={core.decimal_text(notional)} USDT "
+                    f"名义价值={core.decimal_text(notional)} "
+                    f"{'USD' if contract_spec.contract_type == 'inverse' else settle.upper()} "
                     f"计划止盈={core.take_profit_price(order.price, tp_pct, contract_spec.grid_spec)}"
                 )
-            print(f"实盘需 GATE_LIVE_CONFIRM={LIVE_CONFIRM_TEXT}")
+            print("当前为预览模式；实盘需在入口文件启用 LIVE_TRADING，或使用原有环境变量确认")
             return
     finally:
         public_client.close()
