@@ -52,6 +52,7 @@ venv/
 # Local state created by the persistent margin-grid example
 example/.transfer_state/
 example/grid_orders.sqlite3*
+example/btc_sma_4h_long.sqlite3*
 
 # Translations
 *.mo

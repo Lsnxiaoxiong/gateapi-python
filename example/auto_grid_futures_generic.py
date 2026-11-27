@@ -62,6 +62,7 @@ ORPHAN_ORDER_GRACE_SECONDS = 15
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATABASE = SCRIPT_DIR / "grid_orders.sqlite3"
 T = TypeVar("T")
+FuturesRangeKey = tuple[str, str, str, str, str, int]
 
 BUY_OPEN = "已挂单、未成交"
 WAIT_BUY = BUY_OPEN
@@ -466,6 +467,19 @@ class GridStore:
                 ON grid_cycles(currency_pair, strategy_code, buy_price);
                 CREATE INDEX IF NOT EXISTS idx_grid_order_ids
                 ON grid_cycles(buy_order_id, tp_order_id);
+                -- 对账按交易对、策略和单个订单标识查找，避免反复扫描历史周期。
+                CREATE INDEX IF NOT EXISTS idx_grid_buy_order_lookup
+                ON grid_cycles(currency_pair, strategy_code, buy_order_id)
+                WHERE buy_order_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_grid_tp_order_lookup
+                ON grid_cycles(currency_pair, strategy_code, tp_order_id)
+                WHERE tp_order_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_grid_buy_text_lookup
+                ON grid_cycles(currency_pair, strategy_code, buy_order_text)
+                WHERE buy_order_text IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_grid_tp_text_lookup
+                ON grid_cycles(currency_pair, strategy_code, tp_order_text)
+                WHERE tp_order_text IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_grid_pending
                 ON grid_cycles(
                     currency_pair, strategy_code, completed, buy_status, tp_status
@@ -476,6 +490,18 @@ class GridStore:
                     settings TEXT,
                     pending_settings TEXT,
                     PRIMARY KEY(currency_pair, strategy_code)
+                );
+                CREATE TABLE IF NOT EXISTS futures_range_state (
+                    market TEXT NOT NULL,
+                    currency_pair TEXT NOT NULL,
+                    grid_tag TEXT NOT NULL,
+                    lower_price TEXT NOT NULL,
+                    upper_price TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    phase TEXT NOT NULL CHECK (phase IN ('active', 'expired')),
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (market, currency_pair, grid_tag, lower_price,
+                                 upper_price, revision)
                 );
                 """
             )
@@ -543,6 +569,24 @@ class GridStore:
             cursor = self.db.execute(sql, params)
             self.db.commit()
             return int(cursor.lastrowid or 0)
+
+    def futures_range_phase(self, key: FuturesRangeKey) -> str:
+        rows = self.rows(
+            "SELECT phase FROM futures_range_state WHERE market=? AND currency_pair=? "
+            "AND grid_tag=? AND lower_price=? AND upper_price=? AND revision=?",
+            key,
+        )
+        return rows[0]["phase"] if rows else "waiting"
+
+    def save_futures_range_phase(self, key: FuturesRangeKey, phase: str) -> None:
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT INTO futures_range_state(market,currency_pair,grid_tag,lower_price,"
+                "upper_price,revision,phase,updated_at) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(market,currency_pair,grid_tag,lower_price,upper_price,revision) "
+                "DO UPDATE SET phase=excluded.phase,updated_at=excluded.updated_at",
+                (*key, phase, time.time()),
+            )
 
     def active(self, pair: str, code: str) -> list[sqlite3.Row]:
         return self.rows(
@@ -1207,6 +1251,87 @@ def prepare_grid_resume(api, store, pair, code, settings, spec, reconciler):
             "ON CONFLICT(currency_pair,strategy_code) DO UPDATE SET settings=excluded.settings",
             (pair, code, json.dumps(settings)),
         )
+
+
+class FuturesRangeWriteError(RuntimeError):
+    """The current price was observed, but its range transition is not yet saved."""
+
+
+class FuturesGridRange:
+    """现价推进一次性状态，开仓委托价在区间生效后逐笔选档。"""
+
+    @classmethod
+    def from_config(cls, market, pair, grid_tag, lower, upper, margin, revision):
+        try:
+            lower, upper, margin = (Decimal(str(value).strip()) for value in (lower, upper, margin))
+        except InvalidOperation as exc:
+            raise ValueError("震荡区间上下界和每格保证金必须是数字") from exc
+        finite = all(value.is_finite() for value in (lower, upper, margin))
+        if finite and (lower, upper, margin) == (-1, -1, -1):
+            return None
+        if not finite or not (0 < lower < upper and margin > 0):
+            raise ValueError("震荡区间应全部为 -1，或满足 0 < 下界 < 上界且每格保证金大于 0")
+        try:
+            revision = int(str(revision).strip())
+        except ValueError as exc:
+            raise ValueError("range_revision 必须为正整数") from exc
+        if not 1 <= revision <= 2**63 - 1:
+            raise ValueError("range_revision 必须为正整数且在 SQLite 整数范围内")
+        return cls(market, pair, grid_tag, lower, upper, margin, revision)
+
+    def __init__(self, market, pair, grid_tag, lower, upper, margin, revision):
+        self.key = (market, pair, grid_tag, decimal_text(lower), decimal_text(upper), revision)
+        self.configured_bounds = (lower, upper)
+        self.margin = margin
+        self.revision = revision
+        self.phase = "waiting"
+        self._store: Optional[GridStore] = None
+        self._pending_price: Optional[Decimal] = None
+
+    @property
+    def effective_bounds(self) -> tuple[Decimal, Decimal]:
+        if self.phase == "expired":
+            return Decimal("-1"), Decimal("-1")
+        return self.configured_bounds
+
+    def restore(self, store: GridStore) -> None:
+        self.phase = store.futures_range_phase(self.key)
+        self._store = store
+        self._pending_price = None
+
+    def observe(self, current: Decimal) -> None:
+        lower, upper = self.configured_bounds
+        inside = lower <= current <= upper
+        if self.phase == "waiting" and inside:
+            self.phase = "active"
+            self._pending_price = current
+        elif self.phase == "active" and not inside:
+            self.phase = "expired"
+            self._pending_price = current
+
+        if self._store is None or self._pending_price is None:
+            return
+        try:
+            self._store.save_futures_range_phase(self.key, self.phase)
+        except sqlite3.Error as exc:
+            # 保留内存中的越界结果，即使下一轮行情已回到区间也要先写入失效状态。
+            raise FuturesRangeWriteError(f"震荡区间状态保存失败：{exc}") from exc
+        observed = self._pending_price
+        self._pending_price = None
+        print(f"[{now_text()}] {self.key[1]} {self.key[0]} 震荡区间"
+              f"{'已触发' if self.phase == 'active' else '已失效'}，"
+              f"现价={observed}，区间保证金={self.margin}，{self.describe()}")
+
+    def margin_for(self, price: Decimal, regular_margin: Decimal) -> Decimal:
+        lower, upper = self.effective_bounds
+        if self.phase == "active" and lower <= price <= upper:
+            return self.margin
+        return regular_margin
+
+    def describe(self) -> str:
+        label = {"waiting": "等待进入", "active": "已触发", "expired": "已失效"}[self.phase]
+        lower, upper = self.effective_bounds
+        return f"震荡区间状态={label}，有效区间=[{lower}, {upper}]，轮次={self.revision}"
 
 
 class PriceState:

@@ -5,7 +5,7 @@ def run_BTC() -> None:
     run_short_grid(
         contract="BTC_USDT",
         reference_price="68500",
-        margin_amount_per_order="2.5",  # 每格保证金；名义仓位约为保证金×杠杆
+        margin_amount_per_order="1",  # 每格保证金；名义仓位约为保证金×杠杆
         leverage="10",
         settle="usdt",
         short_grid_count=10,
@@ -16,6 +16,10 @@ def run_BTC() -> None:
         startup_mode="resume",
         database_path=DEFAULT_DATABASE,
         poll_interval=2,
+        range_upper_price="-1",  # USDT 报价上界
+        range_lower_price="-1",  # USDT 报价下界，三项同时为 -1 时禁用
+        range_margin_per_order="-1",  # 区间内每格保证金，单位 USDT
+        range_revision=1,  # 已失效的同一区间要再次启用时递增
     )
 
 

@@ -266,10 +266,15 @@ def desired_buy_orders(
     margin: Decimal,
     leverage: Decimal,
     spec: FuturesContractSpec,
+    *,
+    range_state: Optional[core.FuturesGridRange] = None,
 ) -> list[core.PlannedOrder]:
     return [
         core.PlannedOrder(
-            price, calculate_contract_size(margin, leverage, price, spec)
+            price, calculate_contract_size(
+                range_state.margin_for(price, margin) if range_state else margin,
+                leverage, price, spec,
+            )
         )
         for price in core.desired_buy_prices(
             reference, current, step_pct, count, spec.grid_spec.price_step
@@ -597,6 +602,11 @@ def run_grid(
     poll_interval: float = 2.5,
     max_cycles: Optional[int] = None,
     live_trading: Optional[bool] = None,
+    *,
+    range_lower_price="-1",
+    range_upper_price="-1",
+    range_margin_per_order="-1",
+    range_revision: int = 1,
 ) -> None:
     contract = str(contract).strip().upper().replace("-", "_")
     settle = str(settle).strip().lower()
@@ -615,6 +625,10 @@ def run_grid(
     tp_pct = core.decimal_value("take_profit_pct", take_profit_pct)
     if step_pct >= 1 or tp_pct >= 1:
         raise ValueError("网格间距和止盈比例必须小于 1")
+    range_state = core.FuturesGridRange.from_config(
+        f"futures:{settle}:long", contract, grid_tag,
+        range_lower_price, range_upper_price, range_margin_per_order, range_revision,
+    )
 
     core.load_env_file()
     host = os.getenv("GATE_HOST", "https://api.gateio.ws/api/v4").strip()
@@ -633,10 +647,13 @@ def run_grid(
             )
         public_api = FuturesGridApi(public_futures, settle)
         current = core.get_last_price(public_api, contract)
-        desired = desired_buy_orders(
-            reference, current, step_pct, buy_grid_count, margin,
-            leverage_value, contract_spec,
-        )
+        if not live or range_state is None:
+            if range_state is not None:
+                range_state.observe(current)
+            desired = desired_buy_orders(
+                reference, current, step_pct, buy_grid_count, margin,
+                leverage_value, contract_spec, range_state=range_state,
+            )
         if not live:
             print(
                 f"合约安全预览：{contract}，结算币={settle.upper()}，"
@@ -646,12 +663,17 @@ def run_grid(
                 f"每格保证金={margin} {'BTC' if contract_spec.contract_type == 'inverse' else settle.upper()}，"
                 f"数据库={database_path}"
             )
+            if range_state is not None:
+                print(f"按新配置预览，{range_state.describe()}")
             for order in desired:
                 notional = futures_order_notional(order, contract_spec)
+                margin_note = (f"每格保证金={range_state.margin_for(order.price, margin)} {settle.upper()} "
+                               if range_state is not None else "")
                 print(
                     f"买价={order.price} 张数={order.size} "
                     f"名义价值={core.decimal_text(notional)} "
                     f"{'USD' if contract_spec.contract_type == 'inverse' else settle.upper()} "
+                    f"{margin_note}"
                     f"计划止盈={core.take_profit_price(order.price, tp_pct, contract_spec.grid_spec)}"
                 )
             print("当前为预览模式；实盘需在入口文件启用 LIVE_TRADING，或使用原有环境变量确认")
@@ -731,6 +753,16 @@ def run_grid(
         daemon=True,
     )
     try:
+        if range_state is not None:
+            range_state.restore(store)
+            current = core.get_last_price(apis[0], contract)
+            price_state.set(current)
+            range_state.observe(current)
+            desired_buy_orders(
+                reference, current, step_pct, buy_grid_count, margin,
+                leverage_value, contract_spec, range_state=range_state,
+            )
+            print(f"[{core.now_text()}] {contract} 多头 {range_state.describe()}")
         mode = configure_futures_account(
             futures_apis[0], settle, contract, leverage_value
         )
@@ -766,9 +798,11 @@ def run_grid(
             try:
                 current = core.get_last_price(apis[0], contract)
                 price_state.set(current)
+                if range_state is not None:
+                    range_state.observe(current)
                 desired = desired_buy_orders(
                     reference, current, step_pct, buy_grid_count, margin,
-                    leverage_value, contract_spec,
+                    leverage_value, contract_spec, range_state=range_state,
                 )
                 # 资金不足只延后新增开仓；行情、状态同步和止盈线程继续运行。
                 if time.monotonic() >= balance_cooldown_until:
@@ -806,6 +840,8 @@ def run_grid(
                     f"活动周期={len(rows)}"
                 )
                 failures = 0
+            except core.FuturesRangeWriteError as exc:
+                print(f"[{core.now_text()}] {contract} 暂停本轮开仓补单，{exc}")
             except Exception as exc:
                 failures += 1
                 detail = (

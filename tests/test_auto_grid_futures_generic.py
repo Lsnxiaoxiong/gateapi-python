@@ -1,3 +1,4 @@
+from contextlib import closing
 from decimal import Decimal
 import hashlib
 import hmac
@@ -47,6 +48,43 @@ class DatabaseGridTest(unittest.TestCase):
         self.insert("BTC_USDT", price="200")
         self.assertEqual(1, len(self.store.active("ETH_USDT", "code")))
         self.assertEqual(1, len(self.store.active("BTC_USDT", "code")))
+
+    def test_order_lookup_indexes_upgrade_old_db_and_preserve_lookup_results(self):
+        older = self.insert("BTC_USDT", price="101")
+        newer = self.insert("BTC_USDT", price="100")
+        other_pair = self.insert("ETH_USDT")
+        other_strategy = self.insert("BTC_USDT", code="other")
+        # 同一止盈单可关联多个周期，另一交易对和策略中的相同标识不能匹配。
+        self.store.execute(
+            "UPDATE grid_cycles SET buy_order_id='buy-id',buy_order_text='t-open',"
+            "tp_order_id='tp-id',tp_order_text='t-close' WHERE id IN (?,?,?,?)",
+            (older, newer, other_pair, other_strategy),
+        )
+        lookups = (
+            ("idx_grid_buy_order_lookup", "buy_order_id", "find_order", ("buy-id", "buy"), [newer]),
+            ("idx_grid_tp_order_lookup", "tp_order_id", "find_order", ("tp-id", "sell"), [newer]),
+            ("idx_grid_buy_text_lookup", "buy_order_text", "find_order_text", ("t-open", "buy"), [newer]),
+            ("idx_grid_tp_text_lookup", "tp_order_text", "find_order_text", ("t-close", "sell"), [newer]),
+            ("idx_grid_tp_order_lookup", "tp_order_id", "matching_take_profit_rows", ("tp-id",), [newer, older]),
+            ("idx_grid_tp_text_lookup", "tp_order_text", "matching_take_profit_rows", ("", "t-close"), [newer, older]),
+        )
+        for index in {case[0] for case in lookups}:
+            self.store.execute(f"DROP INDEX {index}")
+        original_rows = self.store.rows("SELECT * FROM grid_cycles ORDER BY id")
+
+        with closing(grid.GridStore(self.store.path)) as upgraded:
+            self.assertEqual(original_rows, upgraded.rows("SELECT * FROM grid_cycles ORDER BY id"))
+            for index, column, method, args, expected in lookups:
+                with self.subTest(method=method, column=column):
+                    with patch.object(upgraded, "rows", wraps=upgraded.rows) as rows:
+                        result = getattr(upgraded, method)("BTC_USDT", "code", *args)
+                    actual = result if isinstance(result, list) else [result]
+                    self.assertEqual(expected, [row["id"] for row in actual])
+                    sql, params = rows.call_args.args
+                    plan = upgraded.rows(f"EXPLAIN QUERY PLAN {sql}", params)
+                    self.assertTrue(any(
+                        index in row["detail"] and f"{column}=?" in row["detail"] for row in plan
+                    ), [row["detail"] for row in plan])
 
     def test_resume_can_detect_an_unfinished_different_strategy(self):
         self.insert("ETH_USDT", code="old-code", price="100")

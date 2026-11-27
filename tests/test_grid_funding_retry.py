@@ -105,6 +105,7 @@ class FundingRetryTest(unittest.TestCase):
             time=SimpleNamespace(monotonic=lambda: ticks[0]),
             desired_buy_orders=Mock(return_value=[]),
             desired_short_orders=Mock(return_value=[]),
+            range_state=None,
             short_take_profit_window_lower=Mock(return_value=Decimal("90")),
             place_missing_shorts=placement,
         )
