@@ -135,7 +135,7 @@ def required_env(name: str) -> str:
     return value
 
 
-def load_env_file() -> None:
+def load_env_file(names: Optional[set[str]] = None) -> None:
     for env_file in (SCRIPT_DIR / ".env", SCRIPT_DIR.parent / ".env"):
         if not env_file.is_file():
             continue
@@ -145,9 +145,8 @@ def load_env_file() -> None:
                 continue
             name, value = line.split("=", 1)
             name = name.strip()
-            value = value.strip().strip('"').strip("'")
-            if name:
-                os.environ.setdefault(name, value)
+            if name and (names is None or name in names):
+                os.environ.setdefault(name, value.strip().strip('"').strip("'"))
         return
 
 

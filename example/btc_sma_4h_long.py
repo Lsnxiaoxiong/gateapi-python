@@ -26,8 +26,9 @@ else:
     import auto_grid_futures_generic as core
 
 
-LIVE_TRADING = False  # 改为 True 后使用 .env 中的 Gate API 凭证
+LIVE_TRADING = False  # 改为 True 后读取 CREDENTIALS_PATH 指定的 Gate API 凭证
 ENTRY_CONTRACTS = "1"  # 开仓张数。杠杆和保证金模式使用 Gate 账户当前设置
+CREDENTIALS_PATH = Path("btc_sma_4h_long.credentials.json")  # 相对路径以脚本目录为准，也可填绝对路径
 
 CONTRACT = "BTC_USDT"
 SETTLE = "usdt"
@@ -360,13 +361,31 @@ def run(strategy: Strategy) -> None:
         notifications.close()
 
 
+def load_credentials(path: Path) -> tuple[str, str]:
+    path = Path(__file__).resolve().parent / path.expanduser()
+    try:
+        credentials = json.loads(path.read_text(encoding="utf-8-sig"))
+    except OSError:
+        raise RuntimeError(f"无法读取 Gate 凭证文件 {path}") from None
+    except (UnicodeError, json.JSONDecodeError):
+        raise RuntimeError(f"Gate 凭证文件必须是 UTF-8 格式的 JSON 文件 {path}") from None
+    if not isinstance(credentials, dict):
+        raise RuntimeError(f"Gate 凭证文件必须包含一个 JSON 对象 {path}")
+
+    key = credentials.get("GATE_API_KEY")
+    secret = credentials.get("GATE_API_SECRET")
+    for name, value in (("GATE_API_KEY", key), ("GATE_API_SECRET", secret)):
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"Gate 凭证文件的 {name} 必须是非空字符串 {path}")
+    return key.strip(), secret.strip()
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    core.load_env_file()
+    core.load_env_file({"GATE_HOST", "GATE_PROXY", "GATE_FUTURES_WS_URL"})
     host = os.getenv("GATE_HOST", REST_URL).strip().rstrip("/")
     size = core.decimal_value("ENTRY_CONTRACTS", ENTRY_CONTRACTS)
-    key = core.required_env("GATE_API_KEY") if LIVE_TRADING else None
-    secret = core.required_env("GATE_API_SECRET") if LIVE_TRADING else None
+    key, secret = load_credentials(CREDENTIALS_PATH) if LIVE_TRADING else (None, None)
     with ApiClient(core.make_configuration(host, key, secret)) as client:
         client.set_default_header("X-Gate-Size-Decimal", "1")
         strategy = Strategy(FuturesApi(client), SpotApi(client), host, size, None)

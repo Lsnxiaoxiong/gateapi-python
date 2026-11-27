@@ -39,6 +39,32 @@ def finished(order, order_id=34, left="0"):
     )
 
 
+def test_load_credentials_reads_only_the_configured_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("GATE_API_KEY", "env-key")
+    monkeypatch.setenv("GATE_API_SECRET", "env-secret")
+    path = tmp_path / "account.json"
+    path.write_text('{"GATE_API_KEY": " file-key ", "GATE_API_SECRET": "file-secret"}',
+                    encoding="utf-8-sig")
+    assert bot.load_credentials(path) == ("file-key", "file-secret")
+
+    path.write_text('{"GATE_API_KEY": "file-key", "GATE_API_SECRET": ""}', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="GATE_API_SECRET"):
+        bot.load_credentials(path)
+
+
+def test_live_mode_requires_credentials_file_before_creating_api_client(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "LIVE_TRADING", True)
+    monkeypatch.setattr(bot, "CREDENTIALS_PATH", tmp_path / "missing.json")
+    monkeypatch.setenv("GATE_API_KEY", "env-key")
+    monkeypatch.setenv("GATE_API_SECRET", "env-secret")
+    client = Mock()
+    monkeypatch.setattr(bot, "ApiClient", client)
+
+    with pytest.raises(RuntimeError, match="missing.json"):
+        bot.main()
+    client.assert_not_called()
+
+
 def test_signal_uses_contiguous_closed_candles_and_ignores_current_bar():
     candles = [
         SimpleNamespace(t=BAR - offset * bot.BAR_SECONDS, c="120" if offset < 20 else "100")

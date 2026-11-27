@@ -8,7 +8,7 @@ how this SDK is used. However, you can modify this code directly to implement yo
 
 在仓库根目录运行 `python -m example.btc_sma_4h_long`。配置在脚本顶部，无需命令行参数。
 
-- 默认 `LIVE_TRADING = False`，持续输出 Gate 已收盘的 4 小时 K 线信号。实盘时设为 `True`，并在 `example/.env` 或仓库根目录的 `.env` 配置 `GATE_API_KEY`、`GATE_API_SECRET`。
+- 默认 `LIVE_TRADING = False`，持续输出 Gate 已收盘的 4 小时 K 线信号。实盘时将 `example/btc_sma_4h_long.credentials.example.json` 复制为同目录下的 `btc_sma_4h_long.credentials.json`，填入 `GATE_API_KEY`、`GATE_API_SECRET`，再将 `LIVE_TRADING` 设置为 `True`。实盘凭证仅从脚本顶部 `CREDENTIALS_PATH` 指定的文件读取。相对路径以脚本目录为准，也可指定绝对路径。默认的实盘凭证文件已加入 `.gitignore`。
 - `ENTRY_CONTRACTS` 为开仓张数，默认为 1。使用 Gate 账户现有杠杆和保证金模式。实盘使用单向持仓模式，首次启动时 BTC_USDT 需空仓。请使用独立的子账户，避免同账户的 BTC_USDT 网格、手动交易或其他挂单影响持仓核对。
 - 连续 100 根已收盘 K 线产生信号。SMA20 大于 SMA100 时持多，首次启动遇到这一状态也会开多。其余情况市价只减仓至空仓。部分开仓成交会保留已成交数量，部分平仓成交会在后续检查中继续平剩余仓位。WebSocket 有新周期时触发检查，断线时每 30 秒通过 REST 检查。连接配置沿用 `GATE_PROXY` 和 `GATE_FUTURES_WS_URL`。
 - 重启时使用同一份 `example/btc_sma_4h_long.sqlite3`，先核对上次委托与 Gate 实际持仓，再按最新已收盘 K 线的信号处理。首次启动已有持仓、实际仓位与策略记录不一致、或委托结果仍无法确认时，日志会说明等待原因。
